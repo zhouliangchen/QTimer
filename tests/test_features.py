@@ -78,7 +78,7 @@ class FeatureTests(unittest.TestCase):
         expired = []
         ctrl.stage_expired.connect(expired.append)
         ctrl._target_time = 99
-        with patch.object(q.time, 'time', return_value=100):
+        with patch.object(q.time, 'monotonic', return_value=100):
             ctrl._tick()
             ctrl._tick()
         self.assertTrue(ctrl.paused)
@@ -91,7 +91,7 @@ class FeatureTests(unittest.TestCase):
         self.config.auto_advance = True
         ctrl = self.controller(q.Stage('', 1, '秒'))
         ctrl._target_time = 99
-        with patch.object(q.time, 'time', return_value=100):
+        with patch.object(q.time, 'monotonic', return_value=100):
             ctrl._tick()
         self.assertEqual(ctrl._stage_idx, 1)
         self.assertFalse(ctrl.paused)
@@ -101,7 +101,7 @@ class FeatureTests(unittest.TestCase):
         expired = []
         ctrl.stage_expired.connect(expired.append)
         ctrl._target_time = 99
-        with patch.object(q.time, 'time', return_value=100):
+        with patch.object(q.time, 'monotonic', return_value=100):
             ctrl._tick()
         self.assertEqual(expired, [])
 
@@ -111,7 +111,7 @@ class FeatureTests(unittest.TestCase):
         alerts = []
         ctrl.alert_triggered.connect(lambda color, keep: alerts.append((color, keep)))
         ctrl._target_time = 102
-        with patch.object(q.time, 'time', return_value=100), patch.object(q, 'play_alert_sound') as sound:
+        with patch.object(q.time, 'monotonic', return_value=100), patch.object(q, 'play_alert_sound') as sound:
             ctrl._tick()
         self.assertEqual(alerts, [('#ffff00', True), ('#ff0000', False)])
         sound.assert_not_called()
@@ -347,6 +347,7 @@ class FeatureTests(unittest.TestCase):
                         instance.controller.toggle_pause()
                     with patch.object(q, 'is_ppt_slideshow_active', return_value=False):
                         instance._check_ppt_status()
+                        instance._check_ppt_status()
                     self.assertEqual(instance.controller.paused, pause)
 
     def test_ppt_manual_pause_survives_detection_and_resumes_next_show(self):
@@ -359,6 +360,7 @@ class FeatureTests(unittest.TestCase):
             instance._check_ppt_status()
             self.assertTrue(instance.controller.paused)
         with patch.object(q, 'is_ppt_slideshow_active', return_value=False):
+            instance._check_ppt_status()
             instance._check_ppt_status()
         with patch.object(q, 'is_ppt_slideshow_active', return_value=True):
             instance._check_ppt_status()

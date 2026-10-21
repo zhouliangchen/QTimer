@@ -1,7 +1,6 @@
 import copy
 import ctypes
 from ctypes import wintypes
-import json
 import math
 import os
 import platform
@@ -18,10 +17,11 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import *
 from settings_ui import AppearancePreview, OptionCheckBox, SETTINGS_STYLE, ToggleSwitch, SettingsDragHandle
 from color_sampling import inverse_background, sample_underlay, set_capture_excluded
+from config_storage import read_config, write_config, safe_bool, safe_int, safe_text
 
 APP_ID = "QTimer"  # Stable storage/instance identity preserves existing installations.
 __app_name__ = "超智能计时器"
-__version__ = "1.7.3-guide.1"
+__version__ = "1.8.0-guide.1"
 FORK_URL = "https://github.com/zhouliangchen/QTimer"
 __author__ = "QwejayHuang"
 __company__ = "QwejayHuang"
@@ -51,6 +51,7 @@ OVERTIME_PRESETS = {
 
 
 def timeout_image_path(value: str) -> str:
+    value = safe_text(value)
     if value.startswith("preset:"):
         preset = OVERTIME_PRESETS.get(value.removeprefix("preset:"))
         return resource_path("assets/overtime/" + preset[1]) if preset else ""
@@ -253,12 +254,16 @@ class Stage:
 
     @classmethod
     def from_dict(cls, d: dict) -> 'Stage':
-        return cls(label=d.get("label", ""), duration=d.get("duration", d.get("minutes", 5)),
-                   unit=d.get("unit", "分"), count_up=d.get("count_up", False),
-                   timeout_display=d.get("timeout_display", "zero"),
-                   timeout_text=d.get("timeout_text", "已超时"),
-                   timeout_image=d.get("timeout_image", ""),
-                   timeout_close_show=d.get("timeout_close_show", False))
+        unit = d.get("unit", "分")
+        display = d.get("timeout_display", "zero")
+        return cls(label=safe_text(d.get("label"), "", 100),
+                   duration=safe_int(d.get("duration", d.get("minutes")), 5, 1, 9999),
+                   unit=unit if unit in ("分", "秒") else "分",
+                   count_up=safe_bool(d.get("count_up"), False),
+                   timeout_display=display if display in ("zero", "text", "image") else "zero",
+                   timeout_text=safe_text(d.get("timeout_text"), "已超时", 100),
+                   timeout_image=safe_text(d.get("timeout_image")),
+                   timeout_close_show=safe_bool(d.get("timeout_close_show"), False))
 
 @dataclass
 class Alert:
@@ -269,8 +274,11 @@ class Alert:
 
     @classmethod
     def from_dict(cls, d: dict) -> 'Alert':
-        return cls(seconds=d.get("seconds", 30), color=d.get("color", "#ffaa00"),
-                   play_sound=d.get("play_sound", True), keep_flashing=d.get("keep_flashing", False))
+        color = QColor(safe_text(d.get("color"), "#ffaa00", 64))
+        return cls(seconds=safe_int(d.get("seconds"), 30, 1, 9999),
+                   color=color.name() if color.isValid() else "#ffaa00",
+                   play_sound=safe_bool(d.get("play_sound"), True),
+                   keep_flashing=safe_bool(d.get("keep_flashing"), False))
 
 class Config:
     def __init__(self):
@@ -303,8 +311,10 @@ class Config:
         self.shortcut_prev: str = "Ctrl+Left"
         self.shortcut_next: str = "Ctrl+Right"
         self.ui_scale: int = 100
+        self._last_error = ""
+        self._load_notice = ""
 
-    def save(self) -> None:
+    def save(self) -> bool:
         data = {
             "auto_advance": self.auto_advance,
             "global_sound": self.global_sound,
@@ -336,36 +346,40 @@ class Config:
             "shortcut_next": self.shortcut_next,
             "ui_scale": self.ui_scale,
         }
-        try:
-            tmp_path = CONFIG_PATH + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            if os.path.exists(tmp_path):
-                os.replace(tmp_path, CONFIG_PATH)
-        except Exception:
-            pass
+        success, self._last_error = write_config(CONFIG_PATH, data)
+        return success
 
     def load(self) -> None:
-        if not os.path.exists(CONFIG_PATH):
+        data, notice = read_config(CONFIG_PATH)
+        self._load_notice = notice
+        if data is None:
             return
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if not isinstance(d, dict): return
-            # The previous single switch controlled both actions.
-            if "ppt_auto_pause" not in d and "ppt_auto_start" in d:
-                d["ppt_auto_pause"] = d["ppt_auto_start"]
-            
-            for key in self.__dict__.keys():
-                if key in d and not key.startswith('_'):
-                    setattr(self, key, d[key])
-                    
-            if "stages" in d:
-                self.stages = [Stage.from_dict(s) for s in d["stages"] if isinstance(s, dict)]
-            if "alerts" in d:
-                self.alerts = [Alert.from_dict(a) for a in d["alerts"] if isinstance(a, dict)]
-        except Exception as e:
-            print(f"加载配置失败，将使用默认值: {e}")
+        if "ppt_auto_pause" not in data and "ppt_auto_start" in data:
+            data["ppt_auto_pause"] = data["ppt_auto_start"]
+        defaults = Config()
+        ranges = {"pos_x": (-10000000, 10000000), "pos_y": (-10000000, 10000000),
+                  "bg_transparency": (0, 100), "font_transparency": (0, 100),
+                  "font_size": (20, 60), "stage_font_size": (12, 36), "ui_scale": (50, 300)}
+        for key, default in vars(defaults).items():
+            if key.startswith('_') or key not in data or key in ("stages", "alerts"):
+                continue
+            value = data[key]
+            if key in ranges:
+                value = safe_int(value, default, *ranges[key])
+            elif isinstance(default, bool):
+                value = safe_bool(value, default)
+            else:
+                value = safe_text(value, default)
+                if key in ("color", "bg_color"):
+                    color = QColor(value[:64])
+                    value = color.name() if color.isValid() else default
+            setattr(self, key, value)
+        stages = data.get("stages")
+        if isinstance(stages, list):
+            self.stages = [Stage.from_dict(stage) for stage in stages if isinstance(stage, dict)] or defaults.stages
+        alerts = data.get("alerts")
+        if isinstance(alerts, list):
+            self.alerts = [Alert.from_dict(alert) for alert in alerts if isinstance(alert, dict)]
 
     def bg_qcolor(self) -> QColor:
         c = QColor(self.bg_color)
@@ -404,11 +418,17 @@ class TimerController(QObject):
             return
         if not self.running:
             self.running = True
-        self.paused = not self.paused
-        if not self.paused:
-            self._target_time = time.time() + self._remaining_float
+        if self.paused:
+            self.paused = False
+            self._target_time = time.monotonic() + self._remaining_float
             self._timer.start()
         else:
+            self._remaining_float = max(0.0, self._target_time - time.monotonic())
+            if self._remaining_float <= 0:
+                self._tick()
+                if self.paused:
+                    return
+            self.paused = True
             self._timer.stop()
         self.state_changed.emit(not self.paused)
 
@@ -454,7 +474,7 @@ class TimerController(QObject):
     def _tick(self) -> None:
         if self.paused or not self.config.stages:
             return
-        now = time.time()
+        now = time.monotonic()
         self._remaining_float = self._target_time - now
         rem_sec = max(0, int(math.ceil(self._remaining_float)))
         if rem_sec != self._last_displayed:
@@ -482,7 +502,7 @@ class TimerController(QObject):
             if self.config.auto_advance:
                 self._advance_idx()
                 self._load_stage()
-                self._target_time = time.time() + self._remaining_float
+                self._target_time = time.monotonic() + self._remaining_float
             else:
                 self._stop_and_wait()
 
@@ -1109,6 +1129,7 @@ class SettingsWindow(QDialog):
 
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
+        self.commit_callback = None
         self._original_config = config
         self.config = copy.deepcopy(config)
         self._backup_attrs = copy.deepcopy(config.__dict__)
@@ -1948,12 +1969,17 @@ class SettingsWindow(QDialog):
     def _accept_validated(self) -> None:
         if not self._validate_shortcuts():
             return
+        if not self._stage_rows:
+            QMessageBox.warning(self, "缺少计时环节", "请至少添加一个计时环节后再保存。")
+            return
         for row in self._stage_rows:
             stage = self._stage_from_row(row)
             if not stage.count_up and stage.timeout_display == "image":
                 if not QImageReader(timeout_image_path(stage.timeout_image)).canRead():
                     QMessageBox.warning(self, "图片不可用", "请选择有效的超时图片，或改为显示文字。")
                     return
+        if self.commit_callback is not None and not self.commit_callback(self):
+            return
         self.accept()
 
     def get_config(self) -> Config:
@@ -2010,6 +2036,7 @@ class App(QObject):
         self.hotkey_bridge.next.connect(lambda: self._handle_user_action(self.controller.next_stage, True))
         self._ppt_was_active = False
         self._ppt_stable_active_count = 0
+        self._ppt_stable_inactive_count = 0
         self._current_ppt_session_paused_by_user = False
         self._ppt_monitor_timer = QTimer(self)
         self._ppt_monitor_timer.timeout.connect(self._check_ppt_status)
@@ -2022,22 +2049,38 @@ class App(QObject):
         self._apply_shortcuts()
         self.controller.stop()
         
-        if self.config.pos_x >= 0 and self.config.pos_y >= 0:
+        self._restore_position()
+        self.float_bar.show()
+        self._recover_window_position()
+        self.float_bar.windowHandle().screenChanged.connect(self._recover_window_position)
+
+    def _restore_position(self) -> None:
+        if (self.config.pos_x, self.config.pos_y) != (-1, -1):
             self.float_bar.move_content(QPoint(self.config.pos_x, self.config.pos_y))
         else:
             screen = self.float_bar.screen().availableGeometry()
             self.float_bar.move_content(QPoint(screen.left() + 40, screen.top() + 40))
             
-        self.float_bar.show()
+    def _recover_window_position(self, *_args) -> None:
+        content = QRect(self.float_bar.content_position(), QSize(self.float_bar._text_width, self.float_bar.height()))
+        screens = QApplication.screens()
+        if not screens or any(screen.availableGeometry().intersects(content) for screen in screens):
+            return
+        target = QApplication.primaryScreen() or screens[0]
+        self.float_bar.move_content(target.availableGeometry().topLeft() + QPoint(40, 40))
+        position = self.float_bar.content_position()
+        self._on_position_changed(position.x(), position.y())
 
     def _check_ppt_status(self) -> None:
         if not (self.config.ppt_auto_start or self.config.ppt_auto_pause):
             self._ppt_was_active = False
             self._ppt_stable_active_count = 0
+            self._ppt_stable_inactive_count = 0
             self._current_ppt_session_paused_by_user = False
             return
         is_active = is_ppt_slideshow_active()
         if is_active:
+            self._ppt_stable_inactive_count = 0
             self._ppt_stable_active_count += 1
             if self._ppt_stable_active_count >= 2 and not self._ppt_was_active:
                 self._ppt_was_active = True
@@ -2050,7 +2093,8 @@ class App(QObject):
                         self.controller.toggle_pause()
         else:
             self._ppt_stable_active_count = 0
-            if self._ppt_was_active:
+            self._ppt_stable_inactive_count = min(2, self._ppt_stable_inactive_count + 1)
+            if self._ppt_was_active and self._ppt_stable_inactive_count >= 2:
                 self._ppt_was_active = False
                 self._current_ppt_session_paused_by_user = False
                 if self.config.ppt_auto_pause and not self.controller.paused:
@@ -2169,6 +2213,10 @@ class App(QObject):
             return
         dlg = SettingsWindow(self.config)
         self._settings_window = dlg
+        dlg.commit_callback = self._save_settings
+        if self.config._load_notice:
+            dlg.status_label.setText(self.config._load_notice)
+            dlg.status_label.show()
         dlg.preview_requested.connect(lambda: self._preview_settings(dlg))
         dlg.finished.connect(lambda res: self._finish_settings(dlg, res))
         dlg.show()
@@ -2181,28 +2229,48 @@ class App(QObject):
     def _finish_settings(self, dlg: SettingsWindow, res: int) -> None:
         if res == QDialog.DialogCode.Rejected:
             self._apply_style()
-        else:
-            self._save_settings(dlg)
         self._settings_window = None
-        self.config.save()
+        if res == QDialog.DialogCode.Rejected:
+            self.config.save()
         dlg.deleteLater()
 
-    def _save_settings(self, dlg: SettingsWindow) -> None:
+    def _save_settings(self, dlg: SettingsWindow) -> bool:
         if not dlg._validate_shortcuts():
-            return
+            return False
         updated = dlg.get_config()
+        updated.pos_x, updated.pos_y = self.config.pos_x, self.config.pos_y
+        if not updated.save():
+            QMessageBox.warning(dlg, "保存失败", "设置未能写入磁盘，请检查目录权限或磁盘空间后重试。\n" + updated._last_error)
+            return False
+        stages_changed = updated.stages != self.config.stages
+        keys = ("shortcut_toggle", "shortcut_reset", "shortcut_prev", "shortcut_next")
+        shortcuts_changed = any(getattr(updated, key) != getattr(self.config, key) for key in keys)
         for key, value in updated.__dict__.items():
-            if key not in {"pos_x", "pos_y"}:
+            if not key.startswith('_'):
                 setattr(self.config, key, copy.deepcopy(value))
-        self.config.save()
+        self.config._last_error = ""
+        self.config._load_notice = ""
         self._apply_style()
-        self._apply_shortcuts()
+        if shortcuts_changed:
+            self._apply_shortcuts()
         self.controller.config = self.config
-        self.controller.stop()
+        if stages_changed:
+            self.controller.stop()
+        return True
 
     def _exit(self) -> None:
         if self._settings_window is not None:
             self._settings_window.reject()
+        self._save_timer.stop()
+        position = self.float_bar.content_position()
+        self.config.pos_x, self.config.pos_y = position.x(), position.y()
+        if not self.config.save():
+            choice = QMessageBox.question(self.float_bar, "设置未保存",
+                "设置无法写入磁盘，仍要退出吗？\n" + self.config._last_error,
+                QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            if choice != QMessageBox.StandardButton.Discard:
+                return
         self.controller.stop()
         self._ppt_monitor_timer.stop()
         if HAS_KEYBOARD:
