@@ -1,5 +1,6 @@
 import copy
 import ctypes
+from ctypes import wintypes
 import json
 import math
 import os
@@ -17,7 +18,7 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import *
 
 __app_name__ = "QTimer"
-__version__ = "1.4.0"
+__version__ = "1.5.0-guide.1"
 __author__ = "QwejayHuang"
 __company__ = "QwejayHuang"
 __description__ = "一款极简风格计时器"
@@ -34,6 +35,9 @@ def get_app_dir() -> str:
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
+def resource_path(name: str) -> str:
+    return os.path.join(getattr(sys, '_MEIPASS', get_app_dir()), name)
+
 def get_config_path() -> str:
     loc = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppConfigLocation)
     if not loc:
@@ -46,40 +50,93 @@ def get_config_path() -> str:
 CONFIG_PATH = get_config_path()
 WNDENUMPROC_TYPE = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
-def is_ppt_slideshow_active() -> bool:
-    if platform.system() != "Windows":
+def _matches_ppt_slideshow_window(class_name: str, title: str, process_name: str) -> bool:
+    """Identify show windows without mistaking a generic Qt/editor window for a show."""
+    if process_name.lower() not in {"powerpnt.exe", "wpp.exe", "wps.exe"}:
         return False
+    cls = class_name.lower()
+    if cls in {"screenclass", "kslideshow", "wps_slideshow", "wpp_slideshow_class"}:
+        return True
+    # Current WPS uses Qt5QWindowIcon rather than its older slideshow class.
+    show_title = any(token in title.lower() for token in (
+        "slide show", "slideshow", "幻灯片放映", "幻灯片播放", "演示放映"
+    ))
+    return show_title and (
+        cls.startswith(("qt5qwindow", "qt6qwindow"))
+        or cls in {"paneclassdc", "mso_subwindow_class"}
+    )
+
+def find_ppt_slideshow_windows() -> list[int]:
+    if platform.system() != "Windows":
+        return []
     try:
-        PPT_CLASSES = {
-            "screenclass", "paneclassdc", "mso_subwindow_class",
-            "kslideshow", "wps_slideshow", "wpp_slideshow_class"
-        }
-        
-        buf_cls = ctypes.create_unicode_buffer(256)
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        # Explicit pointer-sized types avoid truncating HWND/HANDLE on 64-bit Windows.
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+        ]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         
         def check_hwnd(hwnd: int) -> bool:
-            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+            if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
                 return False
-            ctypes.windll.user32.GetClassNameW(hwnd, buf_cls, 256)
+            buf_cls = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, buf_cls, 256)
             cls = buf_cls.value.lower()
-            return any(p in cls for p in PPT_CLASSES)
+            if cls not in {
+                "screenclass", "kslideshow", "wps_slideshow", "wpp_slideshow_class",
+                "paneclassdc", "mso_subwindow_class"
+            } and not cls.startswith(("qt5qwindow", "qt6qwindow")):
+                return False
+            title = ctypes.create_unicode_buffer(1024)
+            user32.GetWindowTextW(hwnd, title, len(title))
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            handle = kernel32.OpenProcess(0x1000, False, pid.value)
+            if not handle:
+                return False
+            try:
+                image = ctypes.create_unicode_buffer(32768)
+                length = wintypes.DWORD(len(image))
+                if not kernel32.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)):
+                    return False
+                return _matches_ppt_slideshow_window(cls, title.value, os.path.basename(image.value))
+            finally:
+                kernel32.CloseHandle(handle)
 
-        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
-        if fg_hwnd and check_hwnd(fg_hwnd):
-            return True
-
-        active = [False]
+        active = []
         def enum_cb(hwnd, lparam):
             if check_hwnd(hwnd):
-                active[0] = True
-                return False 
+                active.append(hwnd)
             return True
             
         ctypes.windll.user32.EnumWindows(WNDENUMPROC_TYPE(enum_cb), 0)
-        return active[0]
+        return active
     except Exception as e:
         print(f"PPT检测异常: {e}")
-        return False
+        return []
+
+def is_ppt_slideshow_active() -> bool:
+    return bool(find_ppt_slideshow_windows())
+
+def close_ppt_slideshows() -> None:
+    """Send Escape only to verified slideshow windows, leaving editors open."""
+    if platform.system() != "Windows":
+        return
+    post = ctypes.windll.user32.PostMessageW
+    post.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    for hwnd in find_ppt_slideshow_windows():
+        post(hwnd, 0x0100, 0x1B, 0x00010001)  # WM_KEYDOWN / Escape
+        post(hwnd, 0x0101, 0x1B, 0xC0010001)  # WM_KEYUP
 
 def play_alert_sound(file_path: str = "", duration_ms: int = 200) -> None:
     if file_path and os.path.exists(file_path):
@@ -167,6 +224,10 @@ class Stage:
     duration: int = 5
     unit: str = "分"
     count_up: bool = False
+    timeout_display: str = "zero"
+    timeout_text: str = "已超时"
+    timeout_image: str = ""
+    timeout_close_show: bool = False
 
     @property
     def seconds(self) -> int:
@@ -174,19 +235,24 @@ class Stage:
 
     @classmethod
     def from_dict(cls, d: dict) -> 'Stage':
-        if "minutes" in d and "duration" not in d:
-            return cls(label=d.get("label", ""), duration=d["minutes"], unit="分", count_up=d.get("count_up", False))
-        return cls(label=d.get("label", ""), duration=d.get("duration", 5), unit=d.get("unit", "分"), count_up=d.get("count_up", False))
+        return cls(label=d.get("label", ""), duration=d.get("duration", d.get("minutes", 5)),
+                   unit=d.get("unit", "分"), count_up=d.get("count_up", False),
+                   timeout_display=d.get("timeout_display", "zero"),
+                   timeout_text=d.get("timeout_text", "已超时"),
+                   timeout_image=d.get("timeout_image", ""),
+                   timeout_close_show=d.get("timeout_close_show", False))
 
 @dataclass
 class Alert:
     seconds: int = 30
     color: str = "#ffaa00"
     play_sound: bool = True
+    keep_flashing: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> 'Alert':
-        return cls(seconds=d.get("seconds", 30), color=d.get("color", "#ffaa00"), play_sound=d.get("play_sound", True))
+        return cls(seconds=d.get("seconds", 30), color=d.get("color", "#ffaa00"),
+                   play_sound=d.get("play_sound", True), keep_flashing=d.get("keep_flashing", False))
 
 class Config:
     def __init__(self):
@@ -290,7 +356,8 @@ class Config:
 class TimerController(QObject):
     tick = Signal(str, int)
     stage_changed = Signal(int, str)
-    alert_triggered = Signal(str)
+    alert_triggered = Signal(str, bool)
+    stage_expired = Signal(object)
     loop_restarted = Signal()
     state_changed = Signal(bool)
 
@@ -368,22 +435,25 @@ class TimerController(QObject):
         self._remaining_float = self._target_time - now
         rem_sec = max(0, int(math.ceil(self._remaining_float)))
         if rem_sec != self._last_displayed:
+            previous = self._last_displayed
             self._last_displayed = rem_sec
             st = self.config.stages[self._stage_idx]
             display_sec = max(0, st.seconds - rem_sec) if st.count_up else rem_sec
             self.tick.emit(st.label, display_sec)
-            if self.config.global_sound:
-                if self.config.countdown_10s_sound and 0 < rem_sec <= 10:
-                    play_alert_sound(self.config.alert_sound_path, 200)
-                for a in self.config.alerts:
-                    if rem_sec == a.seconds and a.seconds not in self._triggered:
-                        self._triggered.add(a.seconds)
-                        self.alert_triggered.emit(a.color)
-                        if a.play_sound:
-                            play_alert_sound(self.config.alert_sound_path, 200)
+            if self.config.global_sound and self.config.countdown_10s_sound and 0 < rem_sec <= 10:
+                play_alert_sound(self.config.alert_sound_path, 200)
+            for a in sorted(self.config.alerts, key=lambda alert: alert.seconds, reverse=True):
+                if rem_sec <= a.seconds < previous and a.seconds not in self._triggered:
+                    self._triggered.add(a.seconds)
+                    self.alert_triggered.emit(a.color, a.keep_flashing)
+                    if self.config.global_sound and a.play_sound:
+                        play_alert_sound(self.config.alert_sound_path, 200)
         if self._remaining_float <= 0 and not self._zero_triggered:
             self._zero_triggered = True
             self._remaining_float = 0.0
+            expired_stage = self.config.stages[self._stage_idx]
+            if not expired_stage.count_up:
+                self.stage_expired.emit(expired_stage)
             if self.config.global_sound:
                 play_alert_sound(self.config.end_sound_path, 2000)
             if self.config.auto_advance:
@@ -416,6 +486,9 @@ class FloatBar(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_Hover)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._drag_pos = None
+        self._drawer_left = False
+        self._adjusting_geometry = False
+        self._overtime = None
         self._text_color = "#ffffff"
         self._font_family = "微软雅黑"
         self._font_size = 32
@@ -437,6 +510,9 @@ class FloatBar(QWidget):
         self._flash_state = False
         self._flash_color = "#ff4444"
         self._flash_timer.timeout.connect(self._do_flash)
+        self._flash_stop_timer = QTimer(self)
+        self._flash_stop_timer.setSingleShot(True)
+        self._flash_stop_timer.timeout.connect(self.stop_flash)
         self._width_anim = QPropertyAnimation(self, b"bar_width")
         self._width_anim.setDuration(220)
         self._width_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -458,27 +534,61 @@ class FloatBar(QWidget):
 
     @bar_width.setter
     def bar_width(self, w: int) -> None:
+        right = self.geometry().right()
+        self._adjusting_geometry = True
         self.setFixedWidth(w)
+        if self._drawer_left:
+            self.move(right - self.width() + 1, self.y())
+        self._adjusting_geometry = False
+        self._position_canvas()
+
+    def _position_canvas(self) -> None:
+        self._canvas.move(self.width() - self._full_width if self._drawer_left else 0, 0)
+
+    def _update_drawer_direction(self) -> None:
+        if not hasattr(self, '_text_container') or self._adjusting_geometry:
+            return
+        content_left = self.x() + (self.width() - self._text_width if self._drawer_left else 0)
+        center = QPoint(content_left + self._text_width // 2, self.y() + self.height() // 2)
+        screen = QApplication.screenAt(center) or self.screen()
+        if not screen:
+            return
+        geometry = screen.availableGeometry()
+        left = center.x() >= geometry.left() + geometry.width() * 2 / 3
+        if left == self._drawer_left:
+            return
+        self._drawer_left = left
+        self._layout.setDirection(QBoxLayout.Direction.RightToLeft if left else QBoxLayout.Direction.LeftToRight)
+        self._layout.activate()
+        self._adjusting_geometry = True
+        self.move(content_left - (self.width() - self._text_width if left else 0), self.y())
+        self._adjusting_geometry = False
+        self._position_canvas()
 
     def _build_ui(self) -> None:
         self._canvas = QWidget(self)
         self._canvas.move(0, 0)
         self._layout = QHBoxLayout(self._canvas)
         self._layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self._layout.setContentsMargins(18, 0, 0, 0)
+        self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
+        self._text_container = QWidget()
+        self._text_layout = QHBoxLayout(self._text_container)
+        self._text_layout.setContentsMargins(18, 0, 18, 0)
+        self._text_layout.setSpacing(0)
         
         self.lbl_stage = QLabel("环节名称")
         self.lbl_stage.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_time = QLabel("00:00")
         self.lbl_time.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
-        self._layout.addWidget(self.lbl_stage, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._text_layout.addWidget(self.lbl_stage, 0, Qt.AlignmentFlag.AlignVCenter)
         self._spacing_item = QSpacerItem(12, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._layout.addItem(self._spacing_item)
-        self._layout.addWidget(self.lbl_time, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._text_layout.addItem(self._spacing_item)
+        self._text_layout.addWidget(self.lbl_time, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._layout.addWidget(self._text_container, 0, Qt.AlignmentFlag.AlignVCenter)
         
-        self._end_spacing_item = QSpacerItem(18, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._end_spacing_item = QSpacerItem(16, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._layout.addItem(self._end_spacing_item)
         self._btn_container = QWidget()
         btn_lay = QHBoxLayout(self._btn_container)
@@ -534,8 +644,8 @@ class FloatBar(QWidget):
         self._icon_size = max(16, int(34 * scale))
         icon_inner = max(10, self._icon_size - 8)
         btn_radius = max(3, int(7 * scale))
-        self._layout.setContentsMargins(int(18 * scale), 0, 0, 0)
-        self._end_spacing_item.changeSize(int(18 * scale), 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._text_layout.setContentsMargins(int(18 * scale), 0, int(18 * scale), 0)
+        self._end_spacing_item.changeSize(int(16 * scale), 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._btn_container.layout().setSpacing(int(2 * scale))
         for b in (self.btn_toggle, self.btn_restart, self.btn_prev, self.btn_next, self.btn_settings, self.btn_close):
             b.setFixedSize(self._icon_size, self._icon_size)
@@ -588,9 +698,12 @@ class FloatBar(QWidget):
         fm_stage = self.lbl_stage.fontMetrics()
         fm_time = self.lbl_time.fontMetrics()
         
-        text = self._current_stage_text or "环节名称"
-        sample_text = "88:88:88" if len(self.lbl_time.text()) > 5 else "88:88"
+        text = self._current_stage_text
+        sample_text = (self.lbl_time.text() if self._overtime else
+                       ("88:88:88" if len(self.lbl_time.text()) > 5 else "88:88"))
         time_w = fm_time.horizontalAdvance(sample_text) + int(24 * scale)
+        if self._overtime and self._overtime.timeout_display == "image" and not self.lbl_time.pixmap().isNull():
+            time_w = self.lbl_time.pixmap().width() + int(24 * scale)
         self.lbl_time.setFixedWidth(time_w)
         
         btn_count = 6
@@ -600,7 +713,7 @@ class FloatBar(QWidget):
         base_margin = int(18 * scale)
         stage_spacing = int(12 * scale)
         
-        if self._show_stage_label:
+        if self._show_stage_label and text.strip():
             self.lbl_stage.show()
             self._spacing_item.changeSize(stage_spacing, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             stage_w = fm_stage.horizontalAdvance(text) + int(20 * scale)
@@ -616,15 +729,16 @@ class FloatBar(QWidget):
         h = max(self._font_size + int(24 * scale), int(50 * scale))
         self.lbl_stage.setFixedHeight(int(h))
         self.lbl_time.setFixedHeight(int(h))
+        self._text_container.setFixedSize(int(self._text_width), int(h))
         
         self._canvas.setFixedSize(int(self._full_width), int(h))
         self.setFixedHeight(int(h))
         
         if self.underMouse():
-            self.setFixedWidth(int(self._full_width))
+            self.bar_width = int(self._full_width)
             self._btn_opacity.setOpacity(1.0)
         else:
-            self.setFixedWidth(int(self._text_width))
+            self.bar_width = int(self._text_width)
             self._btn_opacity.setOpacity(0.0)
             
         QTimer.singleShot(10, self._ensure_onscreen)
@@ -637,12 +751,16 @@ class FloatBar(QWidget):
             return
         avail_geo = screen.availableGeometry()
         geo = self.geometry()
-        new_x = max(avail_geo.left(), min(geo.x(), avail_geo.right() - geo.width()))
-        new_y = max(avail_geo.top(), min(geo.y(), avail_geo.bottom() - geo.height()))
+        new_x = max(avail_geo.left(), min(geo.x(), avail_geo.right() - geo.width() + 1))
+        new_y = max(avail_geo.top(), min(geo.y(), avail_geo.bottom() - geo.height() + 1))
         if new_x != geo.x() or new_y != geo.y():
             self.move(new_x, new_y)
 
     def update_display(self, stage: str, display_sec: int) -> None:
+        was_overtime = self._overtime is not None
+        if self._overtime:
+            self._overtime = None
+            self.lbl_time.clear()
         if display_sec >= 3600:
             hh, rem = divmod(display_sec, 3600)
             mm, ss = divmod(rem, 60)
@@ -651,7 +769,7 @@ class FloatBar(QWidget):
             mm, ss = divmod(display_sec, 60)
             time_text = f"{mm:02d}:{ss:02d}"
             
-        if self._current_stage_text != stage or (len(time_text) != len(self.lbl_time.text())):
+        if was_overtime or self._current_stage_text != stage or (len(time_text) != len(self.lbl_time.text())):
             self._current_stage_text = stage
             self.lbl_time.setText(time_text)
             self._update_size()
@@ -666,15 +784,49 @@ class FloatBar(QWidget):
         self.btn_toggle.setIcon(get_svg_icon(icon_name, icon_inner))
 
     def start_flash(self, color: str, auto_stop_ms: int = 3000) -> None:
+        self._flash_stop_timer.stop()
         self._flash_color = color
         self._flash_state = False
         self._flash_timer.start(400)
         if auto_stop_ms > 0:
-            QTimer.singleShot(auto_stop_ms, self.stop_flash)
+            self._flash_stop_timer.start(auto_stop_ms)
 
     def stop_flash(self) -> None:
+        self._flash_stop_timer.stop()
         self._flash_timer.stop()
         self._refresh_labels(stage_color=self._flash_color, time_color=self._flash_color)
+
+    def apply_alert(self, color: str, keep_flashing: bool) -> None:
+        was_persistent = self._flash_timer.isActive() and not self._flash_stop_timer.isActive()
+        if was_persistent and not keep_flashing:
+            self._flash_color = color
+            self.stop_flash()
+        else:
+            self.start_flash(color, 0 if keep_flashing else 3000)
+
+    def reset_alert(self) -> None:
+        self._flash_stop_timer.stop()
+        self._flash_timer.stop()
+        self._flash_color = self._text_color
+        self._refresh_labels()
+
+    def show_overtime(self, stage: Stage) -> None:
+        self._overtime = stage
+        self.lbl_time.clear()
+        if stage.timeout_display == "image":
+            pixmap = QPixmap(stage.timeout_image)
+            if not pixmap.isNull():
+                height = max(20, int(self._font_size + 8 * self._ui_scale / 100))
+                pixmap = pixmap.scaled(300, height, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+                self.lbl_time.setPixmap(pixmap)
+            else:
+                self.lbl_time.setText(stage.timeout_text or "已超时")
+        elif stage.timeout_display == "text":
+            self.lbl_time.setText(stage.timeout_text or "已超时")
+        else:
+            self.lbl_time.setText("00:00")
+        self._update_size()
 
     def _do_flash(self) -> None:
         self._flash_state = not self._flash_state
@@ -682,6 +834,7 @@ class FloatBar(QWidget):
         self._refresh_labels(stage_color=c, time_color=c)
 
     def enterEvent(self, e) -> None:
+        self._update_drawer_direction()
         self._hide_timer.stop()
         self._anim_group.stop()
         self._width_anim.setStartValue(self.width())
@@ -761,26 +914,30 @@ class FloatBar(QWidget):
                 snap_margin = 15
                 if abs(new_x - screen.left()) < snap_margin:
                     new_x = screen.left()
-                elif abs(new_x + self.width() - screen.right()) < snap_margin:
-                    new_x = screen.right() - self.width()
+                elif abs(new_x + self.width() - screen.right() - 1) < snap_margin:
+                    new_x = screen.right() - self.width() + 1
                 if abs(new_y - screen.top()) < snap_margin:
                     new_y = screen.top()
                 elif abs(new_y + self.height() - screen.bottom()) < snap_margin:
-                    new_y = screen.bottom() - self.height()
-                new_x = max(screen.left(), min(new_x, screen.right() - self.width()))
-                new_y = max(screen.top(), min(new_y, screen.bottom() - self.height()))
+                    new_y = screen.bottom() - self.height() + 1
+                new_x = max(screen.left(), min(new_x, screen.right() - self.width() + 1))
+                new_y = max(screen.top(), min(new_y, screen.bottom() - self.height() + 1))
                 new_pos = QPoint(new_x, new_y)
             self.move(new_pos)
+            self._update_drawer_direction()
+            self._drag_pos = e.globalPosition().toPoint() - self.pos()
             QToolTip.showText(e.globalPosition().toPoint(), f"窗体透明度: {self._global_transparency}%", self)
 
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
         self._drag_pos = None
         QToolTip.hideText()
         self._ensure_onscreen()
-        self.position_changed.emit(self.x(), self.y())
+        content_x = self.x() + (self.width() - self._text_width if self._drawer_left else 0)
+        self.position_changed.emit(content_x, self.y())
 
     def moveEvent(self, e: QMoveEvent) -> None:
         super().moveEvent(e)
+        self._update_drawer_direction()
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         if hasattr(self, '_target_opacity'):
             self.setWindowOpacity(self._target_opacity)
@@ -969,7 +1126,9 @@ class SettingsWindow(QDialog):
             "stages": copy.deepcopy(config.stages), "alerts": copy.deepcopy(config.alerts),
         }
         self.setWindowTitle(f"{__app_name__} 设置")
-        self.resize(780, 560)
+        self.resize(920, 680)
+        self.setWindowIcon(QIcon(resource_path("icon.ico")))
+        self.setWindowModality(Qt.WindowModality.NonModal)
         self.setStyleSheet(self._SS)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
         self._stage_rows = []
@@ -988,7 +1147,17 @@ class SettingsWindow(QDialog):
         nav_items = ["⏱️ 流程配置", "🔔 预警声音", "🎨 视觉外观", "⌨️ 快捷操作"]
         self.sidebar.addItems(nav_items)
         self.sidebar.currentRowChanged.connect(self._change_page)
-        root_lay.addWidget(self.sidebar)
+        sidebar_panel = QWidget()
+        sidebar_panel.setFixedWidth(180)
+        sidebar_layout = QVBoxLayout(sidebar_panel)
+        sidebar_layout.setContentsMargins(8, 18, 8, 0)
+        logo = QLabel()
+        logo.setPixmap(QPixmap(resource_path("assets/guide-official-logo.png")).scaled(
+            144, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sidebar_layout.addWidget(logo)
+        sidebar_layout.addWidget(self.sidebar, 1)
+        root_lay.addWidget(sidebar_panel)
         right_panel = QWidget()
         right_lay = QVBoxLayout(right_panel)
         right_lay.setContentsMargins(20, 20, 20, 12)
@@ -1018,7 +1187,7 @@ class SettingsWindow(QDialog):
         
         self.btn_save = QPushButton("保存应用")  
         self.btn_save.setStyleSheet("background-color: #0078d4; color: white; border: none;")
-        self.btn_save.clicked.connect(self.accept)
+        self.btn_save.clicked.connect(self._accept_validated)
         btn_lay.addWidget(self.btn_save)
         
         right_lay.addWidget(bottom_bar)
@@ -1124,7 +1293,7 @@ class SettingsWindow(QDialog):
         behav_lay = QVBoxLayout()
         behav_lay.setSpacing(12)
         behav_lay.addWidget(self._make_setting_row("显示环节名称", "在主悬浮球中同步显示各小节文本标题", self.switch_show_label))
-        behav_lay.addWidget(self._make_setting_row("自动连播", "环节到期时自动切换下个任务并继续倒数", self.switch_auto_advance))
+        behav_lay.addWidget(self._make_setting_row("自动进入下一环节", "关闭后，到期停留在当前环节，需手动切换；开启后自动切换并继续计时", self.switch_auto_advance))
         behav_lay.addWidget(self._make_setting_row("PPT放映联动", "当检测到幻灯片全屏放映时，自动开始计时", self.switch_ppt_auto_start))
         behav_lay.addWidget(self._make_setting_row("双击快捷操作", "双击悬浮窗空白区域快速进行开始/暂停", self.switch_double_click))
         lay.addWidget(self._make_card("行为习惯", behav_lay))
@@ -1321,12 +1490,13 @@ class SettingsWindow(QDialog):
             cmb.setCurrentIndex(cmb.count() - 1)
 
     def _populate(self) -> None:
+        self._populating = True
         self.switch_auto_advance.setChecked(self.config.auto_advance)
         self.switch_show_label.setChecked(self.config.show_stage_label)
         self.switch_ppt_auto_start.setChecked(self.config.ppt_auto_start)
         self.switch_double_click.setChecked(self.config.double_click_toggle)
         for s in self.config.stages:
-            self._add_stage_row(s.label, s.duration, s.unit, s.count_up)
+            self._add_stage_row(**asdict(s))
         if not self.config.stages:
             self._add_stage_row()
         self.switch_global_sound.setChecked(self.config.global_sound)
@@ -1334,7 +1504,7 @@ class SettingsWindow(QDialog):
         self.txt_alert_sound.setText(self.config.alert_sound_path)
         self.txt_end_sound.setText(self.config.end_sound_path)
         for a in self.config.alerts:
-            self._add_alert_row(a.seconds, a.color, a.play_sound)
+            self._add_alert_row(**asdict(a))
         self.switch_always_on_top.setChecked(self.config.always_on_top)
         self.switch_prevent_offscreen.setChecked(self.config.prevent_offscreen)
         self._cur_color = self.config.color
@@ -1353,8 +1523,11 @@ class SettingsWindow(QDialog):
         self.ks_reset.setKeySequence(QKeySequence(self.config.shortcut_reset))
         self.ks_prev.setKeySequence(QKeySequence(self.config.shortcut_prev))
         self.ks_next.setKeySequence(QKeySequence(self.config.shortcut_next))
+        self._populating = False
 
-    def _add_stage_row(self, label: str = "新阶段", duration: int = 3, unit: str = "分", count_up: bool = False) -> None:
+    def _add_stage_row(self, label: str = "新阶段", duration: int = 3, unit: str = "分", count_up: bool = False,
+                       timeout_display: str = "zero", timeout_text: str = "已超时",
+                       timeout_image: str = "", timeout_close_show: bool = False) -> None:
         row_widget = QWidget()
         row_widget.setObjectName("stageRow")
         row_widget.setStyleSheet("""
@@ -1376,12 +1549,15 @@ class SettingsWindow(QDialog):
                 color: #242424;
             }
         """)
-        h = QHBoxLayout(row_widget)
+        card = QVBoxLayout(row_widget)
+        card.setContentsMargins(12, 8, 12, 8)
+        h = QHBoxLayout()
+        card.addLayout(h)
         h.setContentsMargins(12, 8, 12, 8)
         h.setSpacing(10)
         name = QLineEdit()
         name.setText(str(label))
-        name.setPlaceholderText("环节名称")
+        name.setPlaceholderText("环节名称（留空则隐藏）")
         name.setMaxLength(100)
         h.addWidget(name, 2)
         spin = QSpinBox()
@@ -1401,14 +1577,70 @@ class SettingsWindow(QDialog):
         h.addWidget(dir_cmb)
         row = {"widget": row_widget, "name": name, "spin": spin, "unit_cmb": unit_cmb, "dir_cmb": dir_cmb}
         self._add_row_controls(h, self._stage_rows, row, self._rebuild_stage_rows)
+        overtime = QGroupBox("超时行为（仅倒计时）")
+        overtime.setStyleSheet("QGroupBox { border:1px solid #e5e5e5; border-radius:4px; "
+                              "margin-top:10px; padding-top:12px; } "
+                              "QGroupBox::title { subcontrol-origin:margin; left:8px; padding:0 4px; }")
+        grid = QGridLayout(overtime)
+        display = QComboBox()
+        for text, value in (("显示 00:00", "zero"), ("显示文字", "text"), ("显示图片", "image")):
+            display.addItem(text, value)
+        display.setCurrentIndex(max(0, display.findData(timeout_display)))
+        grid.addWidget(QLabel("到零后显示"), 0, 0)
+        grid.addWidget(display, 0, 1)
+        close_show = QCheckBox("超时关闭放映（PowerPoint / WPS）")
+        close_show.setChecked(timeout_close_show)
+        grid.addWidget(close_show, 0, 2)
+        text_edit = QLineEdit(timeout_text)
+        text_edit.setMaxLength(100)
+        text_edit.setPlaceholderText("已超时")
+        grid.addWidget(text_edit, 1, 0, 1, 3)
+        image_panel = QWidget()
+        image_layout = QHBoxLayout(image_panel)
+        image_layout.setContentsMargins(0, 0, 0, 0)
+        image_edit = QLineEdit(timeout_image)
+        image_edit.setReadOnly(True)
+        image_edit.setPlaceholderText("选择超时后显示的图片")
+        image_pick = QPushButton("选择图片…")
+        image_layout.addWidget(image_edit, 1)
+        image_layout.addWidget(image_pick)
+        grid.addWidget(image_panel, 2, 0, 1, 3)
+        hint = QLabel("关闭“自动进入下一环节”可保留超时显示；退出放映不会关闭文稿或软件。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666; font-size:11px;")
+        grid.addWidget(hint, 3, 0, 1, 3)
+        def select_image():
+            path, _ = QFileDialog.getOpenFileName(self, "选择超时图片", image_edit.text(),
+                                                 "图片 (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.svg)")
+            if path:
+                image_edit.setText(path)
+        image_pick.clicked.connect(select_image)
+        def update_timeout_controls():
+            overtime.setEnabled(dir_cmb.currentText() == "倒计时")
+            text_edit.setVisible(display.currentData() == "text")
+            image_panel.setVisible(display.currentData() == "image")
+        display.currentIndexChanged.connect(update_timeout_controls)
+        dir_cmb.currentIndexChanged.connect(update_timeout_controls)
+        update_timeout_controls()
+        card.addWidget(overtime)
+        row.update(timeout_display=display, timeout_text=text_edit,
+                   timeout_image=image_edit, timeout_close_show=close_show)
         self._stage_rows.append(row)
         self._stage_vlay.addWidget(row_widget)
 
     def _rebuild_stage_rows(self) -> None:
         self._rebuild_rows(self._stage_vlay, self._stage_rows,
-                           lambda r: self._add_stage_row(r["name"].text(), r["spin"].value(), r["unit_cmb"].currentText(), r["dir_cmb"].currentText() == "正计时"))
+                           lambda r: self._add_stage_row(**asdict(self._stage_from_row(r))))
 
-    def _add_alert_row(self, seconds: int = 20, color: str = "#ffaa00", play_sound: bool = True) -> None:
+    @staticmethod
+    def _stage_from_row(row: dict) -> Stage:
+        return Stage(row["name"].text(), row["spin"].value(), row["unit_cmb"].currentText(),
+                     row["dir_cmb"].currentText() == "正计时", row["timeout_display"].currentData(),
+                     row["timeout_text"].text(), row["timeout_image"].text(),
+                     row["timeout_close_show"].isChecked())
+
+    def _add_alert_row(self, seconds: int = 20, color: str = "#ffaa00", play_sound: bool = True,
+                       keep_flashing: bool = False) -> None:
         row_widget = QWidget()
         row_widget.setObjectName("alertRow")
         row_widget.setStyleSheet("""
@@ -1449,10 +1681,14 @@ class SettingsWindow(QDialog):
         self._set_color_preview(cbtn, color)
         chk_sound = QCheckBox("伴随音效")
         chk_sound.setChecked(play_sound)
-        row = {"widget": row_widget, "spin": spin, "color": color, "cbtn": cbtn, "chk_sound": chk_sound}
+        chk_flash = QCheckBox("保持闪烁")
+        chk_flash.setChecked(keep_flashing)
+        row = {"widget": row_widget, "spin": spin, "color": color, "cbtn": cbtn,
+               "chk_sound": chk_sound, "chk_flash": chk_flash}
         cbtn.clicked.connect(partial(self._pick_alert_color, row))
         h.addWidget(cbtn)
         h.addWidget(chk_sound)
+        h.addWidget(chk_flash)
         h.addStretch()
         self._add_row_controls(h, self._alert_rows, row, self._rebuild_alert_rows)
         self._alert_rows.append(row)
@@ -1466,7 +1702,7 @@ class SettingsWindow(QDialog):
 
     def _rebuild_alert_rows(self) -> None:
         self._rebuild_rows(self._alert_vlay, self._alert_rows,
-                           lambda r: self._add_alert_row(r["spin"].value(), r["color"], r["chk_sound"].isChecked()))
+                           lambda r: self._add_alert_row(r["spin"].value(), r["color"], r["chk_sound"].isChecked(), r["chk_flash"].isChecked()))
 
     def _add_row_controls(self, layout: QHBoxLayout, rows: list, row: dict, rebuild_fn) -> None:
         layout.addSpacing(10)
@@ -1534,7 +1770,10 @@ class SettingsWindow(QDialog):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self.config = Config()
+            defaults = Config()
+            for key, value in defaults.__dict__.items():
+                if key not in {"pos_x", "pos_y"}:
+                    setattr(self.config, key, copy.deepcopy(value))
             for row in list(self._stage_rows):
                 if row.get("widget"): row["widget"].deleteLater()
             self._stage_rows.clear()
@@ -1578,6 +1817,8 @@ class SettingsWindow(QDialog):
         self._stage_font_cmb.currentTextChanged.connect(self._trigger_live_preview)
 
     def _trigger_live_preview(self) -> None:
+        if getattr(self, '_populating', False):
+            return
         self.config.show_stage_label = self.switch_show_label.isChecked()
         self.config.always_on_top = self.switch_always_on_top.isChecked()
         self.config.prevent_offscreen = self.switch_prevent_offscreen.isChecked()
@@ -1602,6 +1843,17 @@ class SettingsWindow(QDialog):
         self.restore_backup()
         super().reject()
 
+    def _accept_validated(self) -> None:
+        if not self._validate_shortcuts():
+            return
+        for row in self._stage_rows:
+            stage = self._stage_from_row(row)
+            if not stage.count_up and stage.timeout_display == "image":
+                if not QImageReader(stage.timeout_image).canRead():
+                    QMessageBox.warning(self, "图片不可用", "请选择有效的超时图片，或改为显示文字。")
+                    return
+        self.accept()
+
     def get_config(self) -> Config:
         self.config.auto_advance = self.switch_auto_advance.isChecked()
         self.config.show_stage_label = self.switch_show_label.isChecked()
@@ -1613,8 +1865,8 @@ class SettingsWindow(QDialog):
         self.config.end_sound_path = self.txt_end_sound.text().strip()
         self.config.always_on_top = self.switch_always_on_top.isChecked()
         self.config.prevent_offscreen = self.switch_prevent_offscreen.isChecked()
-        self.config.stages = [Stage(r["name"].text(), r["spin"].value(), r["unit_cmb"].currentText(), r["dir_cmb"].currentText() == "正计时") for r in self._stage_rows]
-        self.config.alerts = [Alert(r["spin"].value(), r["color"], r["chk_sound"].isChecked()) for r in self._alert_rows]
+        self.config.stages = [self._stage_from_row(r) for r in self._stage_rows]
+        self.config.alerts = [Alert(r["spin"].value(), r["color"], r["chk_sound"].isChecked(), r["chk_flash"].isChecked()) for r in self._alert_rows]
         self.config.color = self._cur_color
         self.config.bg_color = self._cur_bg_color
         self.config.global_transparency = self._op_slider.value()
@@ -1643,14 +1895,16 @@ class App(QObject):
         super().__init__()
         self.config = Config()
         self.config.load()
+        self._settings_window = None
+        QApplication.instance().setWindowIcon(QIcon(resource_path("icon.ico")))
         self.float_bar = FloatBar()
         self.controller = TimerController(self.config)
         self._shortcuts = []
         self.hotkey_bridge = HotkeyBridge()
-        self.hotkey_bridge.toggle.connect(self.controller.toggle_pause)
-        self.hotkey_bridge.reset.connect(self.controller.restart_stage)
-        self.hotkey_bridge.prev.connect(self.controller.prev_stage)
-        self.hotkey_bridge.next.connect(self.controller.next_stage)
+        self.hotkey_bridge.toggle.connect(lambda: self._handle_user_action(self.controller.toggle_pause))
+        self.hotkey_bridge.reset.connect(lambda: self._handle_user_action(self.controller.restart_stage, True))
+        self.hotkey_bridge.prev.connect(lambda: self._handle_user_action(self.controller.prev_stage, True))
+        self.hotkey_bridge.next.connect(lambda: self._handle_user_action(self.controller.next_stage, True))
         self._ppt_was_active = False
         self._ppt_stable_active_count = 0
         self._current_ppt_session_paused_by_user = False
@@ -1659,7 +1913,7 @@ class App(QObject):
         self._ppt_monitor_timer.start(600)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
-        self._save_timer.timeout.connect(self.config.save)
+        self._save_timer.timeout.connect(self._save_config)
         self._connect_signals()
         self._apply_style()
         self._apply_shortcuts()
@@ -1720,9 +1974,28 @@ class App(QObject):
         fb.wheel_scrolled.connect(self._on_wheel_scrolled)
         fb.position_changed.connect(self._on_position_changed)
         ctrl.tick.connect(lambda lbl, rem: fb.update_display(lbl, rem))
-        ctrl.alert_triggered.connect(lambda c: fb.start_flash(c, 3000))
+        ctrl.alert_triggered.connect(fb.apply_alert)
+        ctrl.stage_changed.connect(lambda *_: fb.reset_alert())
+        ctrl.stage_expired.connect(self._on_stage_expired)
         ctrl.loop_restarted.connect(lambda: fb.start_flash(self.config.color, 1500))
         ctrl.state_changed.connect(fb.set_running)
+
+    def _on_stage_expired(self, stage: Stage) -> None:
+        if not self.config.auto_advance:
+            self.float_bar.show_overtime(stage)
+        if stage.timeout_close_show:
+            close_ppt_slideshows()
+
+    def _save_config(self) -> None:
+        # Do not persist unaccepted live-preview settings when the bar is dragged.
+        if self._settings_window is None:
+            self.config.save()
+
+    def _handle_user_action(self, action, reset: bool = False) -> None:
+        self._on_user_interaction()
+        action()
+        if reset:
+            self._on_stage_reset()
 
     def _on_position_changed(self, x: int, y: int) -> None:
         self.config.pos_x = x
@@ -1738,6 +2011,7 @@ class App(QObject):
 
     def _on_double_clicked(self) -> None:
         if self.config.double_click_toggle:
+            self._on_user_interaction()
             self.controller.toggle_pause()
 
     def _apply_style(self) -> None:
@@ -1769,10 +2043,10 @@ class App(QObject):
                         pass
         else:
             mapping_qt = [
-                (self.config.shortcut_toggle, self.controller.toggle_pause),
-                (self.config.shortcut_reset, self.controller.restart_stage),
-                (self.config.shortcut_prev, self.controller.prev_stage),
-                (self.config.shortcut_next, self.controller.next_stage),
+                (self.config.shortcut_toggle, lambda: self._handle_user_action(self.controller.toggle_pause)),
+                (self.config.shortcut_reset, lambda: self._handle_user_action(self.controller.restart_stage, True)),
+                (self.config.shortcut_prev, lambda: self._handle_user_action(self.controller.prev_stage, True)),
+                (self.config.shortcut_next, lambda: self._handle_user_action(self.controller.next_stage, True)),
             ]
             for key_str, slot_func in mapping_qt:
                 if key_str:
@@ -1782,13 +2056,24 @@ class App(QObject):
                     self._shortcuts.append(sc)
 
     def _open_settings(self) -> None:
+        if self._settings_window is not None:
+            self._settings_window.show()
+            self._settings_window.raise_()
+            self._settings_window.activateWindow()
+            return
         dlg = SettingsWindow(self.config)
+        self._settings_window = dlg
         dlg.preview_requested.connect(self._apply_style)
-        res = dlg.exec()
+        dlg.finished.connect(lambda res: self._finish_settings(dlg, res))
+        dlg.show()
+
+    def _finish_settings(self, dlg: SettingsWindow, res: int) -> None:
         if res == QDialog.DialogCode.Rejected:
             self._apply_style()
         else:
             self._save_settings(dlg)
+        self._settings_window = None
+        self.config.save()
         dlg.deleteLater()
 
     def _save_settings(self, dlg: SettingsWindow) -> None:
@@ -1802,6 +2087,8 @@ class App(QObject):
         self.controller.stop()
 
     def _exit(self) -> None:
+        if self._settings_window is not None:
+            self._settings_window.reject()
         self.controller.stop()
         self._ppt_monitor_timer.stop()
         if HAS_KEYBOARD:

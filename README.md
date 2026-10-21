@@ -1,3 +1,11 @@
+# QTimer · 高德红外定制版
+
+基于 Qwejay/QTimer 的二次开发版本，当前版本 `1.5.0-guide.1`。新增左右自适应抽屉、非模态设置、环节超时文字/图片与自动退出放映、持续闪烁等功能，并修复新版 WPS 放映识别。
+
+**[安装、功能与测试说明](docs/定制版说明.md)** · [维护仓库](https://github.com/zhouliangchen/QTimer) · [原作者仓库](https://github.com/Qwejay/QTimer)
+
+以下保留原项目介绍和更新记录。
+
 # ⏱️ QTimer - 极简流线型桌面悬浮计时器
 
 ![Python Version](https://img.shields.io/badge/Python-3.7+-blue.svg)
