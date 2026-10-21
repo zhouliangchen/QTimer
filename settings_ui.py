@@ -1,15 +1,16 @@
 """Native Qt settings components and a shared visual system."""
-from PySide6.QtCore import Property, QEasingCurve, QPropertyAnimation, QRectF, QSize, Qt
+from PySide6.QtCore import Property, QEasingCurve, QPropertyAnimation, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
-from PySide6.QtWidgets import QCheckBox, QSizePolicy, QWidget
+from PySide6.QtWidgets import QApplication, QCheckBox, QSizePolicy, QWidget
 from color_sampling import inverse_background
 
 
 class SettingsDragHandle(QWidget):
-    """Move a frameless settings dialog using the operating system drag loop."""
+    """Move/resize a frameless dialog with captured mouse events."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
+        self._interaction = None
 
     def _resize_edges(self, position):
         edges = Qt.Edge(0)
@@ -20,6 +21,38 @@ class SettingsDragHandle(QWidget):
         return edges
 
     def mouseMoveEvent(self, event):
+        if self._interaction is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            state = self._interaction
+            window = self.window()
+            pointer = event.globalPosition().toPoint()
+            delta = pointer - state['pointer']
+            geometry = state['geometry']
+            edges = state['edges']
+            if not edges:
+                if delta.manhattanLength() < QApplication.startDragDistance() and not state['moving']:
+                    event.accept()
+                    return
+                state['moving'] = True
+                if window.isMaximized():
+                    fraction = (state['pointer'].x()-geometry.x()) / max(1, geometry.width())
+                    window.showNormal()
+                    window.move(pointer.x()-round(window.width()*fraction),
+                                pointer.y()-min(self.height()//2, state['pointer'].y()-geometry.y()))
+                    state.update(pointer=pointer, geometry=QRect(window.geometry()))
+                else:
+                    window.move(geometry.topLeft() + delta)
+            else:
+                left, top = geometry.x(), geometry.y()
+                right, bottom = left+geometry.width(), top+geometry.height()
+                if edges & Qt.Edge.LeftEdge:
+                    left = max(right-window.maximumWidth(), min(left+delta.x(), right-window.minimumWidth()))
+                if edges & Qt.Edge.RightEdge:
+                    right = max(left+window.minimumWidth(), min(right+delta.x(), left+window.maximumWidth()))
+                if edges & Qt.Edge.TopEdge:
+                    top = max(bottom-window.maximumHeight(), min(top+delta.y(), bottom-window.minimumHeight()))
+                window.setGeometry(left, top, right-left, bottom-top)
+            event.accept()
+            return
         edges = self._resize_edges(event.position())
         cursor = (Qt.CursorShape.SizeBDiagCursor if edges == (Qt.Edge.TopEdge | Qt.Edge.RightEdge)
                   else Qt.CursorShape.SizeVerCursor if edges & Qt.Edge.TopEdge
@@ -29,14 +62,30 @@ class SettingsDragHandle(QWidget):
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            handle = self.window().windowHandle()
-            edges = self._resize_edges(event.position())
-            started = handle and (handle.startSystemResize(edges) if edges else handle.startSystemMove())
-            if started:
-                event.accept()
-                return
+        if self.start_window_action(event, self._resize_edges(event.position())):
+            return
         super().mousePressEvent(event)
+
+    def start_window_action(self, event, edges):
+        if event.button() == Qt.MouseButton.LeftButton:
+            window = self.window()
+            if edges and window.isMaximized():
+                return False
+            self._interaction = dict(pointer=event.globalPosition().toPoint(),
+                                     geometry=QRect(window.geometry()), edges=edges, moving=False)
+            self.grabMouse()
+            event.accept()
+            return True
+        return False
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._interaction is not None:
+            self._interaction = None
+            if QWidget.mouseGrabber() is self:
+                self.releaseMouse()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:

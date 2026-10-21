@@ -21,7 +21,7 @@ from color_sampling import inverse_background, sample_underlay, set_capture_excl
 
 APP_ID = "QTimer"  # Stable storage/instance identity preserves existing installations.
 __app_name__ = "超智能计时器"
-__version__ = "1.7.1-guide.1"
+__version__ = "1.7.2-guide.1"
 FORK_URL = "https://github.com/zhouliangchen/QTimer"
 __author__ = "QwejayHuang"
 __company__ = "QwejayHuang"
@@ -1141,7 +1141,7 @@ class SettingsWindow(QDialog):
         sidebar_panel.setObjectName("settingsSidebar")
         sidebar_panel.setFixedWidth(206)
         sidebar = QVBoxLayout(sidebar_panel)
-        sidebar.setContentsMargins(20, 28, 20, 20)
+        sidebar.setContentsMargins(20, 8, 20, 20)
         sidebar.setSpacing(16)
         logo = QLabel()
         logo.setPixmap(QPixmap(resource_path("assets/guide-official-logo.png")).scaled(
@@ -1174,16 +1174,17 @@ class SettingsWindow(QDialog):
         root.addWidget(sidebar_panel)
         content = QWidget()
         body = QVBoxLayout(content)
-        body.setContentsMargins(28, 25, 8, 18)
+        body.setContentsMargins(28, 0, 8, 18)
         body.setSpacing(14)
         self.page_title = QLabel()
         self.page_title.setObjectName("pageTitle")
         self.page_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         handle = SettingsDragHandle()
+        self._title_handle = handle
         handle.setAccessibleName("拖动或缩放设置窗口")
         handle.setToolTip("拖动标题行移动窗口，上沿或右沿可缩放；双击最大化或还原")
         handle_layout = QHBoxLayout(handle)
-        handle_layout.setContentsMargins(0, 0, 0, 0)
+        handle_layout.setContentsMargins(0, 8, 0, 0)
         handle_layout.addWidget(self.page_title)
         handle_layout.addStretch()
         handle_layout.addWidget(self.btn_close, 0, Qt.AlignmentFlag.AlignTop)
@@ -1227,6 +1228,44 @@ class SettingsWindow(QDialog):
         self.sidebar.currentRowChanged.connect(self._change_page)
         self.sidebar.setCurrentRow(0)
         self.sidebar.setFocus()
+
+    def _in_title_band(self, position: QPointF) -> bool:
+        handle = self._title_handle
+        return 0 <= position.y() < handle.mapTo(self, QPoint()).y() + handle.height()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        # Empty sidebar/content margins propagate here, so the complete top
+        # band works as one title area rather than leaving inert padding.
+        if self._in_title_band(event.position()):
+            position = event.position()
+            edges = Qt.Edge(0)
+            if position.y() <= 5:
+                edges |= Qt.Edge.TopEdge
+            if position.x() <= 5:
+                edges |= Qt.Edge.LeftEdge
+            elif position.x() >= self.width() - 5:
+                edges |= Qt.Edge.RightEdge
+            if self._title_handle.start_window_action(event, edges):
+                return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if self._in_title_band(event.position()):
+            self._title_handle.mouseDoubleClickEvent(event)
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._title_handle._interaction is not None:
+            self._title_handle.mouseMoveEvent(event)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._title_handle._interaction is not None:
+            self._title_handle.mouseReleaseEvent(event)
+            return
+        super().mouseReleaseEvent(event)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)

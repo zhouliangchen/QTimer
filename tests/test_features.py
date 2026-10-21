@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -526,23 +526,61 @@ class FeatureTests(unittest.TestCase):
         APP.sendEvent(bar, q.QMouseEvent(q.QEvent.Type.MouseButtonRelease, local+delta, start+delta,
                       q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.NoButton, q.Qt.KeyboardModifier.NoModifier))
 
-    def test_settings_header_routes_move_and_resize_to_native_window(self):
-        header = q.SettingsDragHandle()
-        self.widgets.append(header)
+    def test_settings_header_moves_resizes_and_respects_minimum_size(self):
+        window = q.QWidget()
+        window.setWindowFlags(q.Qt.WindowType.FramelessWindowHint)
+        self.widgets.append(window)
+        window.setMinimumSize(200, 200)
+        window.setGeometry(100, 100, 700, 400)
+        header = q.SettingsDragHandle(window)
         header.resize(700, 40)
-        window = MagicMock()
-        native = window.windowHandle.return_value
-        native.startSystemMove.return_value = True
-        native.startSystemResize.return_value = True
-        with patch.object(q.SettingsDragHandle, 'window', return_value=window):
-            for position in (q.QPointF(100, 20), q.QPointF(100, 1), q.QPointF(699, 20)):
-                event = q.QMouseEvent(q.QEvent.Type.MouseButtonPress, position, position,
-                                     q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.LeftButton,
-                                     q.Qt.KeyboardModifier.NoModifier)
-                header.mousePressEvent(event)
-        native.startSystemMove.assert_called_once()
-        self.assertEqual(native.startSystemResize.call_args_list[0].args, (q.Qt.Edge.TopEdge,))
-        self.assertEqual(native.startSystemResize.call_args_list[1].args, (q.Qt.Edge.RightEdge,))
+        window.show()
+        APP.processEvents()
+        with patch.object(header, 'grabMouse'):
+            for point, delta, expected in (
+                (q.QPoint(100, 20), q.QPoint(40, 30), q.QRect(140, 130, 700, 400)),
+                (q.QPoint(100, 1), q.QPoint(0, 20), q.QRect(140, 150, 700, 380)),
+                (q.QPoint(699, 20), q.QPoint(35, 0), q.QRect(140, 150, 735, 380)),
+                (q.QPoint(699, 20), q.QPoint(-1000, 0), q.QRect(140, 150, 200, 380)),
+            ):
+                pointer = q.QPointF(header.mapToGlobal(point))
+                header.mousePressEvent(q.QMouseEvent(q.QEvent.Type.MouseButtonPress,
+                    q.QPointF(point), pointer, q.Qt.MouseButton.LeftButton,
+                    q.Qt.MouseButton.LeftButton, q.Qt.KeyboardModifier.NoModifier))
+                header.mouseMoveEvent(q.QMouseEvent(q.QEvent.Type.MouseMove,
+                    q.QPointF(point+delta), pointer+q.QPointF(delta), q.Qt.MouseButton.NoButton,
+                    q.Qt.MouseButton.LeftButton, q.Qt.KeyboardModifier.NoModifier))
+                self.assertEqual(window.geometry(), expected)
+                header.mouseReleaseEvent(q.QMouseEvent(q.QEvent.Type.MouseButtonRelease,
+                    q.QPointF(point+delta), pointer+q.QPointF(delta), q.Qt.MouseButton.LeftButton,
+                    q.Qt.MouseButton.NoButton, q.Qt.KeyboardModifier.NoModifier))
+                self.assertIsNone(header._interaction)
+
+    def test_top_padding_and_sidebar_blank_space_are_draggable(self):
+        dialog = q.SettingsWindow(self.config)
+        self.widgets.append(dialog)
+        dialog.show()
+        APP.processEvents()
+        header = dialog._title_handle
+        self.assertEqual(header.mapTo(dialog, q.QPoint()).y(), 0)
+        with patch.object(header, 'grabMouse'):
+            for point in (q.QPoint(20, 7), q.QPoint(100, 15), q.QPoint(220, 12),
+                          q.QPoint(400, 7), q.QPoint(998, 7)):
+                target = dialog.childAt(point) or dialog
+                before = dialog.pos()
+                pointer = q.QPointF(dialog.mapToGlobal(point))
+                QTest.mousePress(target, q.Qt.MouseButton.LeftButton, pos=target.mapFrom(dialog, point))
+                self.assertIsNotNone(header._interaction, str(point))
+                delta = q.QPointF(30, 20)
+                header.mouseMoveEvent(q.QMouseEvent(q.QEvent.Type.MouseMove,
+                    q.QPointF(point)+delta, pointer+delta, q.Qt.MouseButton.NoButton,
+                    q.Qt.MouseButton.LeftButton, q.Qt.KeyboardModifier.NoModifier))
+                self.assertEqual(dialog.pos(), before+delta.toPoint(), str(point))
+                header.mouseReleaseEvent(q.QMouseEvent(q.QEvent.Type.MouseButtonRelease,
+                    q.QPointF(point)+delta, pointer+delta, q.Qt.MouseButton.LeftButton,
+                    q.Qt.MouseButton.NoButton, q.Qt.KeyboardModifier.NoModifier))
+            QTest.mouseClick(dialog.btn_close, q.Qt.MouseButton.LeftButton)
+            self.assertFalse(dialog.isVisible())
 
     def test_settings_are_frameless_and_requested_notes_are_removed(self):
         dialog = q.SettingsWindow(self.config)
