@@ -1,4 +1,4 @@
-name: Build and Release QTimer
+name: Build and Release 超智能计时器
 
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
               "--noconfirm",
               "--add-data", "assets;assets",
               "--add-data", "icon.ico;.",
-              "-n", "QTimer"
+              "-n", "超智能计时器"
           )
           if (Test-Path "icon.ico") { $buildParams += "--icon=icon.ico" }
           if (Test-Path "version.txt") { $buildParams += "--version-file=version.txt" }
@@ -50,28 +50,28 @@ jobs:
         run: |
           # 动态获取当前触发的版本号 (如 v1.3.2)
           $VER = "${{ github.ref_name }}"
-          if ("${{ github.ref_type }}" -ne "tag") { 
+          if ("${{ github.ref_type }}" -ne "tag") {
               $shortSha = "${{ github.sha }}".Substring(0, 7)
-              $VER = "v-dev-$shortSha" 
+              $VER = "v-dev-$shortSha"
           } elseif (-not $VER.StartsWith("v")) {
               $VER = "v$VER"
           }
-          
+
           New-Item -ItemType Directory -Force -Path "out"
-          
-          # 1. 将 dist/QTimer.exe 重命名为 QTimer_v1.3.2.exe
-          $EXE_NAME = "QTimer_${VER}.exe"
-          Rename-Item -Path "dist/QTimer.exe" -NewName $EXE_NAME
-          
-          # 2. 压缩包名称设置为 QTimer_v1.3.2.zip
-          $ZIP_NAME = "QTimer_${VER}.zip"
-          
-          # 3. 把重命名后的 QTimer_v1.3.2.exe 压缩进 QTimer_v1.3.2.zip
+
+          # 1. 将 dist/超智能计时器.exe 重命名为 超智能计时器_v1.3.2.exe
+          $EXE_NAME = "超智能计时器_${VER}.exe"
+          Rename-Item -Path "dist/超智能计时器.exe" -NewName $EXE_NAME
+
+          # 2. 压缩包名称设置为 超智能计时器_v1.3.2.zip
+          $ZIP_NAME = "超智能计时器_${VER}.zip"
+
+          # 3. 把重命名后的 超智能计时器_v1.3.2.exe 压缩进 超智能计时器_v1.3.2.zip
           Compress-Archive -Path "dist/$EXE_NAME" -DestinationPath "out/$ZIP_NAME"
-          
+
           # 生成 SHA256 校验文件
           Get-FileHash -Path "out/$ZIP_NAME" -Algorithm SHA256 | Out-File -FilePath "out/sha256sum.txt"
-          
+
           Write-Host "Files created successfully in ./out:"
           Get-ChildItem "out"
 
@@ -86,7 +86,7 @@ jobs:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Download Artifact
         uses: actions/download-artifact@v4
@@ -98,16 +98,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release_files/*
-          name: QTimer ${{ github.ref_name }}
+          name: 超智能计时器 ${{ github.ref_name }}
           body: |
-            ## 🚀 QTimer ${{ github.ref_name }}
-            
+            ## 🚀 超智能计时器 ${{ github.ref_name }}
+
             ### 📦 下载链接
-            - **绿色便携包**: `QTimer_${{ github.ref_name }}.zip` 
-            
+            - **绿色便携包**: `超智能计时器_${{ github.ref_name }}.zip`
+
             ### 🔒 文件校验 (SHA-256)
             您可以查阅附件中的 `sha256sum.txt` 校验下载包的完整性。
-            
+
             ---
             *此 Release 由 GitHub Actions 自动打包发布。*
           generate_release_notes: true

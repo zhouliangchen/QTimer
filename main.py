@@ -16,12 +16,14 @@ from PySide6.QtCore import *
 from PySide6.QtGui import *
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import *
+from settings_ui import AppearancePreview, OptionCheckBox, SETTINGS_STYLE, ToggleSwitch
 
-__app_name__ = "QTimer"
-__version__ = "1.5.0-guide.1"
+APP_ID = "QTimer"  # Stable storage/instance identity preserves existing installations.
+__app_name__ = "超智能计时器"
+__version__ = "1.6.0-guide.1"
 __author__ = "QwejayHuang"
 __company__ = "QwejayHuang"
-__description__ = "一款极简风格计时器"
+__description__ = "超智能计时器 · 演示与会议计时"
 
 try:
     import keyboard
@@ -39,11 +41,11 @@ def resource_path(name: str) -> str:
     return os.path.join(getattr(sys, '_MEIPASS', get_app_dir()), name)
 
 def get_config_path() -> str:
-    loc = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppConfigLocation)
+    loc = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
     if not loc:
-        loc = os.path.join(os.path.expanduser("~"), f".{__app_name__.lower()}")
+        loc = os.path.join(os.path.expanduser("~"), f".{APP_ID.lower()}")
     else:
-        loc = os.path.join(loc, __app_name__)
+        loc = os.path.join(loc, APP_ID)
     os.makedirs(loc, exist_ok=True)
     return os.path.join(loc, "config.json")
 
@@ -276,7 +278,6 @@ class Config:
         self.stage_font: str = "微软雅黑"
         self.stage_font_size: int = 18
         self.bg_color: str = "#141414"
-        self.global_transparency: int = 5       
         self.bg_transparency: int = 18         
         self.font_transparency: int = 0         
         self.shortcut_toggle: str = "Ctrl+Space"
@@ -307,7 +308,6 @@ class Config:
             "stage_font": self.stage_font,
             "stage_font_size": self.stage_font_size,
             "bg_color": self.bg_color,
-            "global_transparency": self.global_transparency,
             "bg_transparency": self.bg_transparency,
             "font_transparency": self.font_transparency,
             "shortcut_toggle": self.shortcut_toggle,
@@ -472,6 +472,8 @@ class TimerController(QObject):
             self.loop_restarted.emit()
 
 class FloatBar(QWidget):
+    SNAP_DISTANCE = 12
+    SNAP_RELEASE_DISTANCE = 20
     request_settings = Signal()
     request_exit = Signal()
     double_clicked = Signal()
@@ -486,6 +488,7 @@ class FloatBar(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_Hover)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._drag_pos = None
+        self._drag_axes = {}
         self._drawer_left = False
         self._adjusting_geometry = False
         self._overtime = None
@@ -498,8 +501,7 @@ class FloatBar(QWidget):
         self._show_stage_label = True
         self._prevent_offscreen = True
         self._font_transparency = 0
-        self._target_opacity = 0.95
-        self._global_transparency = 5
+        self._target_opacity = 1.0
         self._ui_scale = 100
         self._icon_size = 34
         self._is_running = False
@@ -655,9 +657,8 @@ class FloatBar(QWidget):
             b.setIconSize(QSize(icon_inner, icon_inner))
             b.setStyleSheet(f"QPushButton {{ background: rgba(255,255,255,15); border: none; border-radius: {btn_radius}px; }} "
                             f"QPushButton:hover {{ background: rgba(255,255,255,40); }}")
-        self._target_opacity = opacity
-        self._global_transparency = int(round((1.0 - opacity) * 100))
-        self.setWindowOpacity(opacity)
+        self._target_opacity = 1.0
+        self.setWindowOpacity(1.0)
         flags = self.windowFlags()
         if always_on_top:
             flags |= Qt.WindowType.WindowStaysOnTopHint
@@ -849,6 +850,8 @@ class FloatBar(QWidget):
         super().leaveEvent(e)
         
     def _do_hide_anim(self) -> None:
+        if self._drag_pos is not None:
+            return
         self._anim_group.stop()
         self._width_anim.setStartValue(self.width())
         self._width_anim.setEndValue(self._text_width)
@@ -899,37 +902,66 @@ class FloatBar(QWidget):
 
     def mousePressEvent(self, e: QMouseEvent) -> None:
         if e.button() == Qt.MouseButton.LeftButton:
+            self._anim_group.stop()
+            self._hide_timer.stop()
             self._drag_pos = e.globalPosition().toPoint() - self.pos()
-            QToolTip.showText(e.globalPosition().toPoint(), f"窗体透明度: {self._global_transparency}%", self)
+            self._drag_start_global = e.globalPosition().toPoint()
+            content_x = self.x() + (self.width() - self._text_width if self._drawer_left else 0)
+            self._drag_content_origin = QPoint(content_x, self.y())
+            screen = (QApplication.screenAt(self._drag_start_global) or self.screen()).availableGeometry()
+            self._drag_screen = screen
+            self._drag_axes = {}
+            for axis, value, low, high, pointer in (
+                ('x', self.x(), screen.left(), screen.right()-self.width()+1, self._drag_start_global.x()),
+                ('y', self.y(), screen.top(), screen.bottom()-self.height()+1, self._drag_start_global.y()),
+            ):
+                edge = 'low' if abs(value-low) <= 2 else ('high' if abs(value-high) <= 2 else None)
+                self._drag_axes[axis] = dict(edge=edge, pointer=pointer, released=False, bias=0)
+
+    def _magnetic_drag_axis(self, value: int, low: int, high: int, axis: str, pointer: int) -> int:
+        state = self._drag_axes[axis]
+        if state['edge']:
+            direction = 1 if state['edge'] == 'low' else -1
+            if (pointer-state['pointer']) * direction <= self.SNAP_RELEASE_DISTANCE:
+                return low if direction == 1 else high
+            # Consume the release distance to avoid a jump at the threshold.
+            state['bias'] -= direction * self.SNAP_RELEASE_DISTANCE
+            state['edge'] = None
+            state['released'] = True
+        value += state['bias']
+        if not state['released']:
+            edge = 'low' if abs(value-low) < self.SNAP_DISTANCE else ('high' if abs(value-high) < self.SNAP_DISTANCE else None)
+            if edge:
+                bound = low if edge == 'low' else high
+                state.update(edge=edge, pointer=pointer, bias=state['bias'] + bound-value)
+                value = bound
+        return max(low, min(value, high))
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
-        if self._drag_pos and e.buttons() == Qt.MouseButton.LeftButton:
-            new_pos = e.globalPosition().toPoint() - self._drag_pos
+        if self._drag_pos is not None and e.buttons() == Qt.MouseButton.LeftButton:
+            pointer = e.globalPosition().toPoint()
+            delta = pointer - self._drag_start_global
+            content = self._drag_content_origin + delta
+            new_pos = QPoint(content.x() - (self.width()-self._text_width if self._drawer_left else 0), content.y())
             if self._prevent_offscreen:
                 screen_obj = QApplication.screenAt(e.globalPosition().toPoint())
                 screen = screen_obj.availableGeometry() if screen_obj else self.screen().availableGeometry()
                 new_x = new_pos.x()
                 new_y = new_pos.y()
 
-                snap_margin = 15
-                if abs(new_x - screen.left()) < snap_margin:
-                    new_x = screen.left()
-                elif abs(new_x + self.width() - screen.right() - 1) < snap_margin:
-                    new_x = screen.right() - self.width() + 1
-                if abs(new_y - screen.top()) < snap_margin:
-                    new_y = screen.top()
-                elif abs(new_y + self.height() - screen.bottom()) < snap_margin:
-                    new_y = screen.bottom() - self.height() + 1
-                new_x = max(screen.left(), min(new_x, screen.right() - self.width() + 1))
-                new_y = max(screen.top(), min(new_y, screen.bottom() - self.height() + 1))
+                if screen != self._drag_screen:
+                    for state in self._drag_axes.values():
+                        state.update(edge=None, released=True, bias=0)
+                    self._drag_screen = screen
+                new_x = self._magnetic_drag_axis(new_x, screen.left(), screen.right()-self.width()+1, 'x', pointer.x())
+                new_y = self._magnetic_drag_axis(new_y, screen.top(), screen.bottom()-self.height()+1, 'y', pointer.y())
                 new_pos = QPoint(new_x, new_y)
             self.move(new_pos)
             self._update_drawer_direction()
-            self._drag_pos = e.globalPosition().toPoint() - self.pos()
-            QToolTip.showText(e.globalPosition().toPoint(), f"窗体透明度: {self._global_transparency}%", self)
 
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
         self._drag_pos = None
+        self._drag_axes = {}
         QToolTip.hideText()
         self._ensure_onscreen()
         content_x = self.x() + (self.width() - self._text_width if self._drawer_left else 0)
@@ -957,176 +989,20 @@ class FloatBar(QWidget):
 class SettingsWindow(QDialog):
     preview_requested = Signal()
     
-    _SS = """
-    QDialog {
-        background-color: #f9f9f9;
-        color: #242424;
-        font-family: 'Microsoft YaHei', sans-serif;
-    }
-
-    QLabel {
-        color: #242424;
-    }
-
-    QListWidget {
-        background: transparent;
-        border: none;
-        border-right: 1px solid #e0e0e0;
-        outline: none;
-        padding-top: 15px;
-    }
-
-    QListWidget::item {
-        height: 42px;
-        padding-left: 15px;
-        color: #444444;
-        font-size: 13px;
-        border-left: 4px solid transparent;
-        border-radius: 6px;
-        margin: 2px 10px;
-    }
-
-    QListWidget::item:hover {
-        background: #f0f0f0;
-    }
-
-    QListWidget::item:selected {
-        background: #f0f7ff;
-        color: #0078d4;
-        font-weight: bold;
-    }
-
-    QLineEdit,
-    QSpinBox,
-    QDoubleSpinBox,
-    QKeySequenceEdit,
-    QComboBox {
-        background: #ffffff;
-        color: #242424;
-        selection-background-color: #0078d4;
-        selection-color: #ffffff;
-        border: 1px solid #d1d1d1;
-        border-radius: 5px;
-    }
-
-    QComboBox QAbstractItemView {
-        background: #ffffff;
-        color: #242424;
-        selection-background-color: #0078d4;
-        selection-color: #ffffff;
-    }
-
-    QKeySequenceEdit {
-        padding: 6px 10px;
-        font-size: 12px;
-    }
-
-    QKeySequenceEdit:focus {
-        border-color: #0078d4;
-    }
-
-    QPushButton {
-        padding: 4px 12px;
-        border: 1px solid #cccccc;
-        border-radius: 4px;
-        background: #ffffff;
-        color: #242424;
-    }
-
-    QPushButton:hover {
-        background: #f0f0f0;
-    }
-
-    QCheckBox {
-        color: #242424;
-    }
-
-    QFrame {
-        color: #242424;
-    }
-
-    QScrollArea {
-        color: #242424;
-    }
-
-    QScrollBar:vertical {
-        background: #f0f0f0;
-        width: 10px;
-        border: none;
-    }
-
-    QScrollBar::handle:vertical {
-        background: #c8c8c8;
-        border-radius: 5px;
-        min-height: 30px;
-    }
-
-    QScrollBar::handle:vertical:hover {
-        background: #aaaaaa;
-    }
-
-    QScrollBar::add-line:vertical,
-    QScrollBar::sub-line:vertical {
-        height: 0px;
-    }
-
-    QScrollBar:horizontal {
-        background: #f0f0f0;
-        height: 10px;
-        border: none;
-    }
-
-    QScrollBar::handle:horizontal {
-        background: #c8c8c8;
-        border-radius: 5px;
-        min-width: 30px;
-    }
-
-    QSlider:horizontal {
-        min-height: 26px;
-    }
-
-    QSlider::groove:horizontal {
-        height: 4px;
-        background: #d6d6d6;
-        border-radius: 2px;
-    }
-
-    QSlider::handle:horizontal {
-        width: 16px;
-        height: 16px;
-        margin: -6px 0;
-        background: #0078d4;
-        border-radius: 8px;
-    }
-
-    QSlider::handle:horizontal:hover {
-        background: #005a9e;
-    }
-    """
+    _SS = SETTINGS_STYLE
+    PREVIEW_FIELDS = ("show_stage_label", "always_on_top", "prevent_offscreen", "color", "bg_color",
+                      "bg_transparency", "font_transparency", "font", "font_size", "stage_font",
+                      "stage_font_size", "ui_scale")
 
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
-        self.config = config
-        self._backup_attrs = {
-            "color": config.color, "bg_color": config.bg_color,
-            "alert_sound_path": config.alert_sound_path,
-            "end_sound_path": config.end_sound_path,
-            "font": config.font, "font_size": config.font_size,
-            "stage_font": config.stage_font, "stage_font_size": config.stage_font_size,
-            "always_on_top": config.always_on_top, "prevent_offscreen": config.prevent_offscreen,
-            "show_stage_label": config.show_stage_label, "auto_advance": config.auto_advance,
-            "ppt_auto_start": config.ppt_auto_start, "double_click_toggle": config.double_click_toggle,
-            "global_sound": config.global_sound, "countdown_10s_sound": config.countdown_10s_sound,
-            "global_transparency": config.global_transparency, "bg_transparency": config.bg_transparency,
-            "font_transparency": config.font_transparency,
-            "shortcut_toggle": config.shortcut_toggle, "shortcut_reset": config.shortcut_reset,
-            "shortcut_prev": config.shortcut_prev, "shortcut_next": config.shortcut_next,
-            "ui_scale": config.ui_scale,
-            "stages": copy.deepcopy(config.stages), "alerts": copy.deepcopy(config.alerts),
-        }
+        self._original_config = config
+        self.config = copy.deepcopy(config)
+        self._backup_attrs = copy.deepcopy(config.__dict__)
         self.setWindowTitle(f"{__app_name__} 设置")
-        self.resize(920, 680)
+        self.resize(1040, 790)
+        self.setMinimumSize(920, 650)
+        self.setObjectName("settingsDialog")
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setStyleSheet(self._SS)
@@ -1138,103 +1014,131 @@ class SettingsWindow(QDialog):
         self._connect_live_preview_triggers()
 
     def _build_ui(self) -> None:
-        root_lay = QHBoxLayout(self)
-        root_lay.setContentsMargins(0, 0, 0, 0)
-        root_lay.setSpacing(0)
-        self.sidebar = QListWidget()
-        self.sidebar.setFixedWidth(160)
-        self.sidebar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        nav_items = ["⏱️ 流程配置", "🔔 预警声音", "🎨 视觉外观", "⌨️ 快捷操作"]
-        self.sidebar.addItems(nav_items)
-        self.sidebar.currentRowChanged.connect(self._change_page)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
         sidebar_panel = QWidget()
-        sidebar_panel.setFixedWidth(180)
-        sidebar_layout = QVBoxLayout(sidebar_panel)
-        sidebar_layout.setContentsMargins(8, 18, 8, 0)
+        sidebar_panel.setObjectName("settingsSidebar")
+        sidebar_panel.setFixedWidth(206)
+        sidebar = QVBoxLayout(sidebar_panel)
+        sidebar.setContentsMargins(20, 28, 20, 20)
+        sidebar.setSpacing(16)
         logo = QLabel()
         logo.setPixmap(QPixmap(resource_path("assets/guide-official-logo.png")).scaled(
-            144, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sidebar_layout.addWidget(logo)
-        sidebar_layout.addWidget(self.sidebar, 1)
-        root_lay.addWidget(sidebar_panel)
-        right_panel = QWidget()
-        right_lay = QVBoxLayout(right_panel)
-        right_lay.setContentsMargins(20, 20, 20, 12)
-        right_lay.setSpacing(12)
+            150, 44, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        sidebar.addWidget(logo)
+        brand = QLabel(__app_name__)
+        brand.setObjectName("brandName")
+        sidebar.addWidget(brand)
+        sidebar.addSpacing(12)
+        self.sidebar = QListWidget()
+        self.sidebar.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.sidebar.addItems(["流程配置", "预警与声音", "外观与显示", "快捷操作"])
+        self.sidebar.setAccessibleName("设置分区")
+        sidebar.addWidget(self.sidebar, 1)
+        version = QLabel(f"版本 {__version__}")
+        version.setObjectName("settingsHint")
+        sidebar.addWidget(version)
+        copyright = QLabel('<a href="https://github.com/Qwejay/QTimer" style="color:#8b99ac; text-decoration:none;">基于 QTimer · QwejayHuang</a>')
+        copyright.setOpenExternalLinks(True)
+        copyright.setStyleSheet("font-size:10px;")
+        sidebar.addWidget(copyright)
+        root.addWidget(sidebar_panel)
+        content = QWidget()
+        body = QVBoxLayout(content)
+        body.setContentsMargins(28, 25, 24, 18)
+        body.setSpacing(14)
+        self.page_title = QLabel()
+        self.page_title.setObjectName("pageTitle")
+        self.page_description = QLabel()
+        self.page_description.setObjectName("pageDescription")
+        body.addWidget(self.page_title)
+        body.addWidget(self.page_description)
+        body.addSpacing(5)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_page_stages())
         self.pages.addWidget(self._build_page_alerts())
         self.pages.addWidget(self._build_page_appearance())
         self.pages.addWidget(self._build_page_shortcuts())
-        right_lay.addWidget(self.pages)
-        bottom_bar = QWidget()
-        btn_lay = QHBoxLayout(bottom_bar)
-        btn_lay.setContentsMargins(0, 0, 0, 0)
-        lbl_copyright = QLabel('<a href="https://github.com/Qwejay/QTimer" style="color: #999; text-decoration: none;">Copyright © 2026 QwejayHuang</a>')
-        lbl_copyright.setOpenExternalLinks(True)
-        lbl_copyright.setStyleSheet("font-size: 11px;")
-        btn_lay.addWidget(lbl_copyright)
-        btn_lay.addStretch()
-        
+        body.addWidget(self.pages, 1)
+        self.status_label = QLabel("外观更改即时预览，保存后应用全部设置。")
+        self.status_label.setObjectName("settingsStatus")
+        self.status_label.setWordWrap(True)
+        body.addWidget(self.status_label)
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
         self.btn_restore = QPushButton("恢复默认")
+        self.btn_restore.setProperty("role", "quiet")
+        self.btn_restore.setToolTip("将所有设置恢复为默认值，保存后生效；取消可撤销。")
         self.btn_restore.clicked.connect(self._restore_defaults)
-        btn_lay.addWidget(self.btn_restore)
-        
+        actions.addWidget(self.btn_restore)
+        actions.addStretch()
         self.btn_cancel = QPushButton("取消")
         self.btn_cancel.clicked.connect(self.reject)
-        btn_lay.addWidget(self.btn_cancel)
-        
-        self.btn_save = QPushButton("保存应用")  
-        self.btn_save.setStyleSheet("background-color: #0078d4; color: white; border: none;")
+        actions.addWidget(self.btn_cancel)
+        self.btn_save = QPushButton("保存设置")
+        self.btn_save.setProperty("role", "primary")
+        self.btn_save.setMinimumWidth(112)
         self.btn_save.clicked.connect(self._accept_validated)
-        btn_lay.addWidget(self.btn_save)
-        
-        right_lay.addWidget(bottom_bar)
-        root_lay.addWidget(right_panel)
+        actions.addWidget(self.btn_save)
+        body.addLayout(actions)
+        root.addWidget(content, 1)
+        self.sidebar.currentRowChanged.connect(self._change_page)
         self.sidebar.setCurrentRow(0)
+        self.sidebar.setFocus()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not getattr(self, '_initial_focus_set', False):
+            self._initial_focus_set = True
+            self.sidebar.setFocus()
+            QTimer.singleShot(0, lambda: self.pages.currentWidget().verticalScrollBar().setValue(0))
 
     def _change_page(self, idx: int) -> None:
+        titles = [
+            ("流程配置", "规划计时环节，安排放映联动与超时行为。"),
+            ("预警与声音", "在关键时间节点提醒，专注每一次演示。"),
+            ("外观与显示", "调整色彩、通透度与字体，让计时信息清晰可见。"),
+            ("快捷操作", "通过键盘控制计时，无需离开当前演示。"),
+        ]
         self.pages.setCurrentIndex(idx)
+        self.page_title.setText(titles[idx][0])
+        self.page_description.setText(titles[idx][1])
 
     def _make_setting_row(self, title: str, subtitle: str, control: QWidget) -> QWidget:
-        w = QWidget()
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        text_lay = QVBoxLayout()
-        text_lay.setSpacing(2)
-        lbl_title = QLabel(title)
-        lbl_title.setStyleSheet("font-weight: bold; color: #333;")
-        text_lay.addWidget(lbl_title)
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 5, 0, 5)
+        layout.setSpacing(20)
+        text = QVBoxLayout()
+        text.setSpacing(4)
+        heading = QLabel(title)
+        heading.setObjectName("rowTitle")
+        text.addWidget(heading)
         if subtitle:
-            lbl_sub = QLabel(subtitle)
-            lbl_sub.setStyleSheet("color: #777; font-size: 11px;")
-            text_lay.addWidget(lbl_sub)
-        lay.addLayout(text_lay)
-        lay.addStretch()
-        lay.addWidget(control)
-        return w
+            description = QLabel(subtitle)
+            description.setObjectName("rowDescription")
+            description.setWordWrap(True)
+            text.addWidget(description)
+        layout.addLayout(text, 1)
+        control.setAccessibleName(title)
+        layout.addWidget(control, 0, Qt.AlignmentFlag.AlignVCenter)
+        return row
 
     def _make_card(self, title: str, layout: QLayout) -> QWidget:
         card = QFrame()
-        card.setStyleSheet("QFrame { background: white; border: 1px solid #e0e0e0; border-radius: 8px; }")
-        vlay = QVBoxLayout(card)
-        vlay.setContentsMargins(16, 16, 16, 16)
-        vlay.setSpacing(12)
+        card.setObjectName("settingsCard")
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(18, 17, 18, 18)
+        outer.setSpacing(14)
         if title:
-            lbl = QLabel(title)
-            lbl.setStyleSheet(
-                "font-size: 15px; "
-                "font-weight: bold; "
-                "color: #242424; "
-                "background: transparent; "
-                "border: none;"
-            )
-            vlay.addWidget(lbl)
+            heading = QLabel(title)
+            heading.setObjectName("cardTitle")
+            outer.addWidget(heading)
         inner = QWidget()
-        inner.setStyleSheet("border: none;")
+        inner.setObjectName("cardBody")
         inner.setLayout(layout)
-        vlay.addWidget(inner)
+        outer.addWidget(inner)
         return card
 
     def _make_sound_picker_row(self, title: str, line_edit: QLineEdit, default_duration: int = 200) -> QWidget:
@@ -1286,10 +1190,10 @@ class SettingsWindow(QDialog):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
-        self.switch_show_label = QCheckBox()
-        self.switch_auto_advance = QCheckBox()
-        self.switch_ppt_auto_start = QCheckBox()
-        self.switch_double_click = QCheckBox()
+        self.switch_show_label = ToggleSwitch()
+        self.switch_auto_advance = ToggleSwitch()
+        self.switch_ppt_auto_start = ToggleSwitch()
+        self.switch_double_click = ToggleSwitch()
         behav_lay = QVBoxLayout()
         behav_lay.setSpacing(12)
         behav_lay.addWidget(self._make_setting_row("显示环节名称", "在主悬浮球中同步显示各小节文本标题", self.switch_show_label))
@@ -1324,8 +1228,8 @@ class SettingsWindow(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
         
-        self.switch_global_sound = QCheckBox()
-        self.switch_10s_sound = QCheckBox()
+        self.switch_global_sound = ToggleSwitch()
+        self.switch_10s_sound = ToggleSwitch()
         snd_lay = QVBoxLayout()
         snd_lay.setSpacing(12)
         snd_lay.addWidget(self._make_setting_row("启用所有提示音", "全局控制蜂鸣与音频的播放许可", self.switch_global_sound))
@@ -1362,89 +1266,87 @@ class SettingsWindow(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea{background: transparent; border: none;}")
-        w = QWidget()
-        w.setObjectName("scrollWidget")
-        w.setStyleSheet("#scrollWidget{background: transparent;}")
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(12)
-        c_lay = QGridLayout()
-        c_lay.setVerticalSpacing(12)
-        c_lay.setHorizontalSpacing(15)
-        
-        self._color_preview = QPushButton("拾取颜色")
-        self._color_preview.setFixedSize(110, 32)
-        self._color_preview.setCursor(Qt.CursorShape.PointingHandCursor)
+        content = QWidget()
+        content.setObjectName("scrollWidget")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(16)
+        preview_layout = QVBoxLayout()
+        self.appearance_preview = AppearancePreview()
+        preview_layout.addWidget(self.appearance_preview)
+        layout.addWidget(self._make_card("外观预览", preview_layout))
+        colors = QVBoxLayout()
+        colors.setSpacing(12)
+        self._color_preview = QPushButton()
+        self._color_preview.setMinimumWidth(140)
         self._color_preview.clicked.connect(lambda: self._pick_color(self._color_preview, "_cur_color"))
-        
-        self._bg_color_preview = QPushButton("拾取颜色")
-        self._bg_color_preview.setFixedSize(110, 32)
-        self._bg_color_preview.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._bg_color_preview = QPushButton()
+        self._bg_color_preview.setMinimumWidth(140)
         self._bg_color_preview.clicked.connect(lambda: self._pick_color(self._bg_color_preview, "_cur_bg_color"))
-        
-        self._op_slider = QSlider(Qt.Orientation.Horizontal)
-        self._op_slider.setRange(0, 70)  
+        colors.addWidget(self._make_setting_row("文字颜色", "用于计时数字与环节名称", self._color_preview))
+        colors.addWidget(self._make_setting_row("背景颜色", "悬浮计时条的背景底色", self._bg_color_preview))
         self._bg_op_slider = QSlider(Qt.Orientation.Horizontal)
         self._bg_op_slider.setRange(0, 100)
         self._font_trans_slider = QSlider(Qt.Orientation.Horizontal)
-        self._font_trans_slider.setRange(0, 100) 
-        c_lay.addWidget(QLabel("数字/文字颜色:"), 0, 0)
-        c_lay.addWidget(self._color_preview, 0, 1)
-        c_lay.addWidget(QLabel("窗口背景底色:"), 1, 0)
-        c_lay.addWidget(self._bg_color_preview, 1, 1)
-        c_lay.addWidget(QLabel("全局穿透度:"), 0, 2)
-        c_lay.addWidget(self._op_slider, 0, 3)
-        c_lay.addWidget(QLabel("背景通透度:"), 1, 2)
-        c_lay.addWidget(self._bg_op_slider, 1, 3)
-        c_lay.addWidget(QLabel("字体通透度:"), 2, 2)
-        c_lay.addWidget(self._font_trans_slider, 2, 3)
-        c_lay.setColumnStretch(1, 1)
-        c_lay.setColumnStretch(3, 1)
-        lay.addWidget(self._make_card("色彩与材质", c_lay))
-        
-        f_lay = QGridLayout()
-        f_lay.setVerticalSpacing(12)
-        f_lay.setHorizontalSpacing(15)
+        self._font_trans_slider.setRange(0, 100)
+        colors.addWidget(self._make_setting_row("背景通透度", "0% 不透明，100% 完全透明", self._make_slider_control(self._bg_op_slider, "%", "背景通透度")))
+        colors.addWidget(self._make_setting_row("字体通透度", "0% 清晰可见，100% 完全透明", self._make_slider_control(self._font_trans_slider, "%", "字体通透度")))
+        layout.addWidget(self._make_card("色彩与材质", colors))
+        typography = QVBoxLayout()
+        typography.setSpacing(10)
         self._font_cmb = self._create_fast_font_combobox(self.config.font)
+        self._font_cmb.setMinimumWidth(250)
+        self._stage_font_cmb = self._create_fast_font_combobox(self.config.stage_font)
+        self._stage_font_cmb.setMinimumWidth(250)
         self._size_slider = QSlider(Qt.Orientation.Horizontal)
         self._size_slider.setRange(20, 60)
-        self._stage_font_cmb = self._create_fast_font_combobox(self.config.stage_font)
         self._stage_size_slider = QSlider(Qt.Orientation.Horizontal)
         self._stage_size_slider.setRange(12, 36)
         self._ui_scale_slider = QSlider(Qt.Orientation.Horizontal)
         self._ui_scale_slider.setRange(50, 300)
-        
-        f_lay.addWidget(QLabel("数字字体族:"), 0, 0)
-        f_lay.addWidget(self._font_cmb, 0, 1)
-        f_lay.addWidget(QLabel("数字字号大小:"), 1, 0)
-        f_lay.addWidget(self._size_slider, 1, 1)
-        f_lay.addWidget(QLabel("全局缩放比例:"), 2, 0)
-        f_lay.addWidget(self._ui_scale_slider, 2, 1)
-        f_lay.addWidget(QLabel("小节文本字体:"), 0, 2)
-        f_lay.addWidget(self._stage_font_cmb, 0, 3)
-        f_lay.addWidget(QLabel("小节文本字号:"), 1, 2)
-        f_lay.addWidget(self._stage_size_slider, 1, 3)
-        f_lay.setColumnStretch(1, 1)
-        f_lay.setColumnStretch(3, 1)
-        lay.addWidget(self._make_card("排版与尺寸", f_lay))
-        
-        win_lay = QVBoxLayout()
-        win_lay.setSpacing(12)
-        self.switch_always_on_top = QCheckBox()
-        self.switch_prevent_offscreen = QCheckBox()
-        win_lay.addWidget(self._make_setting_row("窗口置顶显示", "强行保持在所有应用之上，避免被遮盖", self.switch_always_on_top))
-        win_lay.addWidget(self._make_setting_row("边缘磁吸/防出界", "拖动时限制不出屏，靠近边界自动吸附", self.switch_prevent_offscreen))
-        lay.addWidget(self._make_card("窗口行为", win_lay))
-        lay.addStretch()
-        scroll.setWidget(w)
+        typography.addWidget(self._make_setting_row("数字字体", "计时数字的字体", self._font_cmb))
+        typography.addWidget(self._make_setting_row("数字字号", "调整倒计时的大小", self._make_slider_control(self._size_slider, " px", "数字字号")))
+        typography.addWidget(self._make_setting_row("环节字体", "环节名称的字体", self._stage_font_cmb))
+        typography.addWidget(self._make_setting_row("环节字号", "调整环节名称的大小", self._make_slider_control(self._stage_size_slider, " px", "环节字号")))
+        typography.addWidget(self._make_setting_row("界面缩放", "同比例缩放计时条与控制按钮", self._make_slider_control(self._ui_scale_slider, "%", "界面缩放")))
+        layout.addWidget(self._make_card("排版与尺寸", typography))
+        windows = QVBoxLayout()
+        windows.setSpacing(12)
+        self.switch_always_on_top = ToggleSwitch()
+        self.switch_prevent_offscreen = ToggleSwitch()
+        windows.addWidget(self._make_setting_row("窗口置顶", "全屏放映时保持计时条可见", self.switch_always_on_top))
+        windows.addWidget(self._make_setting_row("边缘吸附与防出界", "靠近屏幕边缘自动贴齐，避免拖出屏幕", self.switch_prevent_offscreen))
+        layout.addWidget(self._make_card("窗口行为", windows))
+        layout.addStretch()
+        scroll.setWidget(content)
         return scroll
+
+    def _make_slider_control(self, slider: QSlider, unit: str, name: str) -> QWidget:
+        widget = QWidget()
+        widget.setMinimumWidth(270)
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        slider.setAccessibleName(name)
+        value = QSpinBox()
+        value.setRange(slider.minimum(), slider.maximum())
+        value.setSuffix(unit)
+        value.setFixedWidth(78)
+        value.setAccessibleName(name + "数值")
+        # Keep the Python receiver alive: PySide bound-method connections alone
+        # do not retain a wrapper owned only by the Qt widget hierarchy.
+        slider._value_editor = value
+        slider.valueChanged.connect(value.setValue)
+        value.valueChanged.connect(slider.setValue)
+        row.addWidget(slider, 1)
+        row.addWidget(value)
+        return widget
 
     def _build_page_shortcuts(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
-        txt = "点击下方输入框后在键盘上直接按下组合键即可。\n如环境已安装keyboard模块，热键将支持在PPT全屏等失去焦点时盲操。"
+        txt = "点击下方输入框后在键盘上直接按下组合键即可。\n在全屏演示中也可使用，快捷键请避免与演示软件冲突。"
         help_banner = QLabel(txt)
         help_banner.setStyleSheet("color: #005a9e; background-color: #f0f7ff; border: 1px solid #cce3f5; border-radius: 6px; padding: 12px; font-size: 12px; line-height: 1.4;")
         lay.addWidget(help_banner)
@@ -1490,70 +1392,69 @@ class SettingsWindow(QDialog):
             cmb.setCurrentIndex(cmb.count() - 1)
 
     def _populate(self) -> None:
+        source = copy.deepcopy(self.config)
         self._populating = True
-        self.switch_auto_advance.setChecked(self.config.auto_advance)
-        self.switch_show_label.setChecked(self.config.show_stage_label)
-        self.switch_ppt_auto_start.setChecked(self.config.ppt_auto_start)
-        self.switch_double_click.setChecked(self.config.double_click_toggle)
-        for s in self.config.stages:
-            self._add_stage_row(**asdict(s))
-        if not self.config.stages:
-            self._add_stage_row()
-        self.switch_global_sound.setChecked(self.config.global_sound)
-        self.switch_10s_sound.setChecked(self.config.countdown_10s_sound)
-        self.txt_alert_sound.setText(self.config.alert_sound_path)
-        self.txt_end_sound.setText(self.config.end_sound_path)
-        for a in self.config.alerts:
-            self._add_alert_row(**asdict(a))
-        self.switch_always_on_top.setChecked(self.config.always_on_top)
-        self.switch_prevent_offscreen.setChecked(self.config.prevent_offscreen)
-        self._cur_color = self.config.color
-        self._set_color_preview(self._color_preview, self._cur_color)
-        self._cur_bg_color = self.config.bg_color
-        self._set_color_preview(self._bg_color_preview, self._cur_bg_color)
-        self._op_slider.setValue(self.config.global_transparency)
-        self._bg_op_slider.setValue(self.config.bg_transparency)
-        self._font_trans_slider.setValue(self.config.font_transparency)
-        self._set_combobox_font(self._font_cmb, self.config.font)
-        self._size_slider.setValue(self.config.font_size)
-        self._set_combobox_font(self._stage_font_cmb, self.config.stage_font)
-        self._stage_size_slider.setValue(self.config.stage_font_size)
-        self._ui_scale_slider.setValue(self.config.ui_scale)
-        self.ks_toggle.setKeySequence(QKeySequence(self.config.shortcut_toggle))
-        self.ks_reset.setKeySequence(QKeySequence(self.config.shortcut_reset))
-        self.ks_prev.setKeySequence(QKeySequence(self.config.shortcut_prev))
-        self.ks_next.setKeySequence(QKeySequence(self.config.shortcut_next))
-        self._populating = False
+        try:
+            self._clear_form_rows(self._stage_vlay, self._stage_rows)
+            self._clear_form_rows(self._alert_vlay, self._alert_rows)
+            self.switch_auto_advance.setChecked(source.auto_advance)
+            self.switch_show_label.setChecked(source.show_stage_label)
+            self.switch_ppt_auto_start.setChecked(source.ppt_auto_start)
+            self.switch_double_click.setChecked(source.double_click_toggle)
+            for s in source.stages:
+                self._add_stage_row(**asdict(s))
+            if not source.stages:
+                self._add_stage_row()
+            self.switch_global_sound.setChecked(source.global_sound)
+            self.switch_10s_sound.setChecked(source.countdown_10s_sound)
+            self.txt_alert_sound.setText(source.alert_sound_path)
+            self.txt_end_sound.setText(source.end_sound_path)
+            for a in source.alerts:
+                self._add_alert_row(**asdict(a))
+            self.switch_always_on_top.setChecked(source.always_on_top)
+            self.switch_prevent_offscreen.setChecked(source.prevent_offscreen)
+            self._cur_color = source.color
+            self._set_color_preview(self._color_preview, self._cur_color)
+            self._cur_bg_color = source.bg_color
+            self._set_color_preview(self._bg_color_preview, self._cur_bg_color)
+            self._bg_op_slider.setValue(source.bg_transparency)
+            self._font_trans_slider.setValue(source.font_transparency)
+            self._set_combobox_font(self._font_cmb, source.font)
+            self._size_slider.setValue(source.font_size)
+            self._set_combobox_font(self._stage_font_cmb, source.stage_font)
+            self._stage_size_slider.setValue(source.stage_font_size)
+            self._ui_scale_slider.setValue(source.ui_scale)
+            for slider in (self._bg_op_slider, self._font_trans_slider, self._size_slider,
+                           self._stage_size_slider, self._ui_scale_slider):
+                slider._value_editor.setValue(slider.value())
+            self.ks_toggle.setKeySequence(QKeySequence(source.shortcut_toggle))
+            self.ks_reset.setKeySequence(QKeySequence(source.shortcut_reset))
+            self.ks_prev.setKeySequence(QKeySequence(source.shortcut_prev))
+            self.ks_next.setKeySequence(QKeySequence(source.shortcut_next))
+        finally:
+            self._populating = False
+        self.appearance_preview.set_config(self.config)
+
+    @staticmethod
+    def _clear_form_rows(layout: QVBoxLayout, rows: list) -> None:
+        rows.clear()
+        while layout.count():
+            widget = layout.takeAt(0).widget()
+            if widget:
+                widget.hide()
+                widget.deleteLater()
 
     def _add_stage_row(self, label: str = "新阶段", duration: int = 3, unit: str = "分", count_up: bool = False,
                        timeout_display: str = "zero", timeout_text: str = "已超时",
                        timeout_image: str = "", timeout_close_show: bool = False) -> None:
         row_widget = QWidget()
         row_widget.setObjectName("stageRow")
-        row_widget.setStyleSheet("""
-            QWidget#stageRow {
-                background: #ffffff;
-                color: #242424;
-                border: 1px solid #eaeaea;
-                border-radius: 6px;
-            }
 
-            QWidget#stageRow:hover {
-                border-color: #0078d4;
-            }
-
-            QWidget#stageRow QLineEdit,
-            QWidget#stageRow QSpinBox,
-            QWidget#stageRow QComboBox {
-                background: #ffffff;
-                color: #242424;
-            }
-        """)
         card = QVBoxLayout(row_widget)
         card.setContentsMargins(12, 8, 12, 8)
         h = QHBoxLayout()
         card.addLayout(h)
-        h.setContentsMargins(12, 8, 12, 8)
+        h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(10)
         name = QLineEdit()
         name.setText(str(label))
@@ -1578,9 +1479,7 @@ class SettingsWindow(QDialog):
         row = {"widget": row_widget, "name": name, "spin": spin, "unit_cmb": unit_cmb, "dir_cmb": dir_cmb}
         self._add_row_controls(h, self._stage_rows, row, self._rebuild_stage_rows)
         overtime = QGroupBox("超时行为（仅倒计时）")
-        overtime.setStyleSheet("QGroupBox { border:1px solid #e5e5e5; border-radius:4px; "
-                              "margin-top:10px; padding-top:12px; } "
-                              "QGroupBox::title { subcontrol-origin:margin; left:8px; padding:0 4px; }")
+
         grid = QGridLayout(overtime)
         display = QComboBox()
         for text, value in (("显示 00:00", "zero"), ("显示文字", "text"), ("显示图片", "image")):
@@ -1588,7 +1487,7 @@ class SettingsWindow(QDialog):
         display.setCurrentIndex(max(0, display.findData(timeout_display)))
         grid.addWidget(QLabel("到零后显示"), 0, 0)
         grid.addWidget(display, 0, 1)
-        close_show = QCheckBox("超时关闭放映（PowerPoint / WPS）")
+        close_show = OptionCheckBox("超时关闭放映（PowerPoint / WPS）")
         close_show.setChecked(timeout_close_show)
         grid.addWidget(close_show, 0, 2)
         text_edit = QLineEdit(timeout_text)
@@ -1643,29 +1542,9 @@ class SettingsWindow(QDialog):
                        keep_flashing: bool = False) -> None:
         row_widget = QWidget()
         row_widget.setObjectName("alertRow")
-        row_widget.setStyleSheet("""
-            QWidget#alertRow {
-                background: #ffffff;
-                color: #242424;
-                border: 1px solid #eaeaea;
-                border-radius: 6px;
-            }
 
-            QWidget#alertRow:hover {
-                border-color: #0078d4;
-            }
-
-            QWidget#alertRow QSpinBox {
-                background: #ffffff;
-                color: #242424;
-            }
-
-            QWidget#alertRow QCheckBox {
-                color: #242424;
-            }
-        """)
         h = QHBoxLayout(row_widget)
-        h.setContentsMargins(12, 8, 12, 8)
+        h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(10)
         lbl = QLabel("剩余时长：")
         h.addWidget(lbl)
@@ -1679,9 +1558,9 @@ class SettingsWindow(QDialog):
         cbtn.setFixedSize(32, 32)
         cbtn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._set_color_preview(cbtn, color)
-        chk_sound = QCheckBox("伴随音效")
+        chk_sound = OptionCheckBox("伴随音效")
         chk_sound.setChecked(play_sound)
-        chk_flash = QCheckBox("保持闪烁")
+        chk_flash = OptionCheckBox("保持闪烁")
         chk_flash.setChecked(keep_flashing)
         row = {"widget": row_widget, "spin": spin, "color": color, "cbtn": cbtn,
                "chk_sound": chk_sound, "chk_flash": chk_flash}
@@ -1710,21 +1589,21 @@ class SettingsWindow(QDialog):
         btn_up.setFixedSize(28, 28)
         btn_up.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_up.setIcon(get_svg_icon("up", 14, "#666666"))
-        btn_up.setStyleSheet("QPushButton { background:transparent; border:none; border-radius:4px; } QPushButton:hover { background:#e1e1e1; }")
+        btn_up.setStyleSheet("QPushButton { background:transparent; border:none; border-radius:4px; padding:0; } QPushButton:hover { background:#e1e1e1; }")
         btn_up.clicked.connect(partial(self._move_row, rows, row, -1, rebuild_fn))
         layout.addWidget(btn_up)
         btn_down = QPushButton()
         btn_down.setFixedSize(28, 28)
         btn_down.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_down.setIcon(get_svg_icon("down", 14, "#666666"))
-        btn_down.setStyleSheet("QPushButton { background:transparent; border:none; border-radius:4px; } QPushButton:hover { background:#e1e1e1; }")
+        btn_down.setStyleSheet("QPushButton { background:transparent; border:none; border-radius:4px; padding:0; } QPushButton:hover { background:#e1e1e1; }")
         btn_down.clicked.connect(partial(self._move_row, rows, row, 1, rebuild_fn))
         layout.addWidget(btn_down)
         btn_del = QPushButton()
         btn_del.setFixedSize(28, 28)
         btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_del.setIcon(get_svg_icon("trash", 14, "#d13438"))
-        btn_del.setStyleSheet("QPushButton { background:transparent; border:none; border-radius:4px; } QPushButton:hover { background:#fde7e9; }")
+        btn_del.setStyleSheet("QPushButton { background:transparent; border:none; border-radius:4px; padding:0; } QPushButton:hover { background:#fde7e9; }")
         btn_del.clicked.connect(partial(self._delete_row, rows, row, rebuild_fn))
         layout.addWidget(btn_del)
 
@@ -1759,30 +1638,25 @@ class SettingsWindow(QDialog):
 
     @staticmethod
     def _set_color_preview(widget: QWidget, color: str) -> None:
-        if isinstance(widget, QPushButton) and widget.text() == "":
-            widget.setStyleSheet(f"background: {color}; border: 1px solid #d1d1d1; border-radius: 4px;")
+        swatch = QPixmap(18, 18)
+        swatch.fill(QColor(color))
+        widget.setIcon(QIcon(swatch))
+        widget.setToolTip(color.upper())
+        if widget.width() <= 40:
+            widget.setText("")
+            widget.setStyleSheet("padding:0;")
         else:
-            widget.setStyleSheet(f"background: {color}; border: 1px solid #d1d1d1; border-radius: 4px; color: {color};")
+            widget.setText(color.upper())
 
     def _restore_defaults(self) -> None:
-        reply = QMessageBox.question(
-            self, "确认重置", "是否确认恢复默认配置？您的修改将被覆盖。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            defaults = Config()
-            for key, value in defaults.__dict__.items():
-                if key not in {"pos_x", "pos_y"}:
-                    setattr(self.config, key, copy.deepcopy(value))
-            for row in list(self._stage_rows):
-                if row.get("widget"): row["widget"].deleteLater()
-            self._stage_rows.clear()
-            for row in list(self._alert_rows):
-                if row.get("widget"): row["widget"].deleteLater()
-            self._alert_rows.clear()
-            self._populate()
-            self._trigger_live_preview()
-            QMessageBox.information(self, "重置成功", "已加载默认方案。点击“保存应用”后生效。")
+        # Restore only the draft. Existing timers/flows keep running until Save.
+        positions = {key: getattr(self.config, key) for key in ("pos_x", "pos_y")}
+        self.config.__dict__.clear()
+        self.config.__dict__.update(copy.deepcopy(Config().__dict__))
+        self.config.__dict__.update(positions)
+        self._populate()
+        self._trigger_live_preview()
+        self.status_label.setText("已恢复默认值。保存设置后生效，取消可撤销。")
 
     def _validate_shortcuts(self) -> bool:
         mapping = {
@@ -1807,7 +1681,6 @@ class SettingsWindow(QDialog):
         self.switch_show_label.toggled.connect(self._trigger_live_preview)
         self.switch_always_on_top.toggled.connect(self._trigger_live_preview)
         self.switch_prevent_offscreen.toggled.connect(self._trigger_live_preview)
-        self._op_slider.valueChanged.connect(self._trigger_live_preview)
         self._bg_op_slider.valueChanged.connect(self._trigger_live_preview)
         self._font_trans_slider.valueChanged.connect(self._trigger_live_preview)
         self._size_slider.valueChanged.connect(self._trigger_live_preview)
@@ -1824,20 +1697,19 @@ class SettingsWindow(QDialog):
         self.config.prevent_offscreen = self.switch_prevent_offscreen.isChecked()
         self.config.color = self._cur_color
         self.config.bg_color = self._cur_bg_color
-        self.config.global_transparency = self._op_slider.value()
         self.config.bg_transparency = self._bg_op_slider.value()
         self.config.font_transparency = self._font_trans_slider.value()
-        self.config.opacity = (100 - self.config.global_transparency) / 100
         self.config.font = self._font_cmb.currentText()
         self.config.font_size = self._size_slider.value()
         self.config.stage_font = self._stage_font_cmb.currentText()
         self.config.stage_font_size = self._stage_size_slider.value()
         self.config.ui_scale = self._ui_scale_slider.value()
+        self.appearance_preview.set_config(self.config)
         self.preview_requested.emit()
 
     def restore_backup(self) -> None:
-        for k, v in self._backup_attrs.items():
-            setattr(self.config, k, v)
+        for key in self.PREVIEW_FIELDS:
+            setattr(self._original_config, key, copy.deepcopy(self._backup_attrs[key]))
 
     def reject(self) -> None:
         self.restore_backup()
@@ -1869,10 +1741,8 @@ class SettingsWindow(QDialog):
         self.config.alerts = [Alert(r["spin"].value(), r["color"], r["chk_sound"].isChecked(), r["chk_flash"].isChecked()) for r in self._alert_rows]
         self.config.color = self._cur_color
         self.config.bg_color = self._cur_bg_color
-        self.config.global_transparency = self._op_slider.value()
         self.config.bg_transparency = self._bg_op_slider.value()
         self.config.font_transparency = self._font_trans_slider.value()
-        self.config.opacity = (100 - self.config.global_transparency) / 100
         self.config.font = self._font_cmb.currentText()
         self.config.font_size = self._size_slider.value()
         self.config.stage_font = self._stage_font_cmb.currentText()
@@ -1898,6 +1768,7 @@ class App(QObject):
         self._settings_window = None
         QApplication.instance().setWindowIcon(QIcon(resource_path("icon.ico")))
         self.float_bar = FloatBar()
+        self.float_bar.setWindowTitle(__app_name__)
         self.controller = TimerController(self.config)
         self._shortcuts = []
         self.hotkey_bridge = HotkeyBridge()
@@ -2016,7 +1887,7 @@ class App(QObject):
 
     def _apply_style(self) -> None:
         c = self.config
-        opacity_float = max(0.3, min(1.0, (100 - c.global_transparency) / 100))
+        opacity_float = 1.0
         self.float_bar.apply_style(c.color, c.font, c.font_size, c.stage_font, c.stage_font_size,
                                    opacity_float, c.bg_qcolor(), c.always_on_top, c.show_stage_label, 
                                    c.prevent_offscreen, c.font_transparency, c.ui_scale)
@@ -2063,9 +1934,14 @@ class App(QObject):
             return
         dlg = SettingsWindow(self.config)
         self._settings_window = dlg
-        dlg.preview_requested.connect(self._apply_style)
+        dlg.preview_requested.connect(lambda: self._preview_settings(dlg))
         dlg.finished.connect(lambda res: self._finish_settings(dlg, res))
         dlg.show()
+
+    def _preview_settings(self, dlg: SettingsWindow) -> None:
+        for key in dlg.PREVIEW_FIELDS:
+            setattr(self.config, key, copy.deepcopy(getattr(dlg.config, key)))
+        self._apply_style()
 
     def _finish_settings(self, dlg: SettingsWindow, res: int) -> None:
         if res == QDialog.DialogCode.Rejected:
@@ -2079,7 +1955,10 @@ class App(QObject):
     def _save_settings(self, dlg: SettingsWindow) -> None:
         if not dlg._validate_shortcuts():
             return
-        dlg.get_config()
+        updated = dlg.get_config()
+        for key, value in updated.__dict__.items():
+            if key not in {"pos_x", "pos_y"}:
+                setattr(self.config, key, copy.deepcopy(value))
         self.config.save()
         self._apply_style()
         self._apply_shortcuts()
@@ -2110,12 +1989,14 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
     
     app.setApplicationName(__app_name__)
+    app.setApplicationDisplayName(__app_name__)
+    app.setApplicationVersion(__version__)
     app.setQuitOnLastWindowClosed(False)
     translator = QTranslator()
     locale = QLocale.system().name()  
     if translator.load(f"qt_{locale}", QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)):
         app.installTranslator(translator)
-    shared_mem_key = f"{__app_name__}_SingleInstance_MemoryLock"
+    shared_mem_key = f"{APP_ID}_SingleInstance_MemoryLock"
     shared_mem = QSharedMemory(shared_mem_key)
     
     if not shared_mem.create(1):

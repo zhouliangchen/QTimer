@@ -6,7 +6,7 @@ base = fso.GetParentFolderName(WScript.ScriptFullName)
 python = fso.BuildPath(base, ".venv\Scripts\pythonw.exe")
 script = fso.BuildPath(base, "main.py")
 If Not fso.FileExists(python) Then
-    MsgBox "Create .venv and install requirements.txt first.", 16, "QTimer"
+    MsgBox "Create .venv and install requirements.txt first.", 16, "Super Smart Timer"
     WScript.Quit 1
 End If
 shell.CurrentDirectory = base

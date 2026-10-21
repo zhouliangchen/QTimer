@@ -241,5 +241,89 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(dialog.config.bg_transparency, q.Config().bg_transparency)
         self.assertEqual(dialog.config.font_transparency, q.Config().font_transparency)
 
+    def test_transparency_reset_updates_live_bar_save_and_reopen(self):
+        instance = self.instance()
+        instance._open_settings()
+        dialog = instance._settings_window
+        dialog._bg_op_slider.setValue(100)
+        dialog._font_trans_slider.setValue(100)
+        self.assertEqual(instance.float_bar._bg_color.alpha(), 1)
+        self.assertEqual(instance.float_bar._font_transparency, 100)
+        dialog.btn_restore.click()
+        defaults = q.Config()
+        self.assertEqual(dialog._bg_op_slider.value(), defaults.bg_transparency)
+        self.assertEqual(dialog._font_trans_slider.value(), defaults.font_transparency)
+        self.assertEqual(dialog._bg_op_slider._value_editor.value(), defaults.bg_transparency)
+        self.assertEqual(dialog._font_trans_slider._value_editor.value(), defaults.font_transparency)
+        self.assertEqual(instance.float_bar._bg_color.alpha(), defaults.bg_qcolor().alpha())
+        self.assertEqual(instance.float_bar._font_transparency, 0)
+        self.assertEqual(instance.float_bar.windowOpacity(), 1.0)
+        self.assertEqual(dialog._stage_vlay.count(), len(defaults.stages))
+        dialog._accept_validated()
+        restored = q.Config()
+        restored.load()
+        self.assertEqual(restored.bg_transparency, defaults.bg_transparency)
+        self.assertEqual(restored.font_transparency, defaults.font_transparency)
+        instance._open_settings()
+        self.assertEqual(instance._settings_window._bg_op_slider.value(), defaults.bg_transparency)
+
+    def test_reset_draft_keeps_running_sequence_and_cancel_restores_opacity(self):
+        self.config.stages = [q.Stage('keep', 7, '秒')]
+        self.config.bg_transparency = 41
+        self.config.font_transparency = 23
+        instance = self.instance()
+        instance._open_settings()
+        dialog = instance._settings_window
+        dialog._bg_op_slider.setValue(95)
+        dialog._font_trans_slider.setValue(85)
+        dialog._restore_defaults()
+        self.assertEqual(instance.config.stages[0].label, 'keep')
+        self.assertEqual(instance.controller._remaining_float, 7)
+        dialog.reject()
+        self.assertEqual(instance.config.bg_transparency, 41)
+        self.assertEqual(instance.config.font_transparency, 23)
+        self.assertEqual(instance.float_bar._font_transparency, 23)
+
+    def test_removed_global_opacity_is_ignored_in_old_configuration(self):
+        Path(q.CONFIG_PATH).write_text(json.dumps({'global_transparency': 70, 'bg_transparency': 32}), encoding='utf-8')
+        restored = q.Config()
+        restored.load()
+        self.assertFalse(hasattr(restored, 'global_transparency'))
+        self.assertEqual(restored.bg_transparency, 32)
+        restored.save()
+        self.assertNotIn('global_transparency', json.loads(Path(q.CONFIG_PATH).read_text(encoding='utf-8')))
+
+    def test_all_docked_edges_release_after_cumulative_drag_threshold(self):
+        for edge in ('left', 'right', 'top', 'bottom'):
+            with self.subTest(edge=edge):
+                bar = self.bar()
+                bar.update_display('', 300)
+                screen = bar.screen().availableGeometry()
+                x, y = screen.center().x(), screen.center().y()
+                if edge == 'left': x = screen.left()
+                if edge == 'right': x = screen.right()-bar.width()+1
+                if edge == 'top': y = screen.top()
+                if edge == 'bottom': y = screen.bottom()-bar.height()+1
+                bar.move(x, y)
+                bar._update_drawer_direction()
+                start_pos = bar.pos()
+                local = q.QPointF(10, 10)
+                global_start = q.QPointF(bar.mapToGlobal(q.QPoint(10, 10)))
+                def event(kind, delta, button, buttons):
+                    APP.sendEvent(bar, q.QMouseEvent(kind, local+delta, global_start+delta,
+                                  button, buttons, q.Qt.KeyboardModifier.NoModifier))
+                event(q.QEvent.Type.MouseButtonPress, q.QPointF(), q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.LeftButton)
+                direction = q.QPointF(1 if edge=='left' else -1, 0) if edge in ('left','right') else q.QPointF(0, 1 if edge=='top' else -1)
+                for distance in (5, 10, 19):
+                    event(q.QEvent.Type.MouseMove, direction*distance, q.Qt.MouseButton.NoButton, q.Qt.MouseButton.LeftButton)
+                    self.assertEqual(bar.pos(), start_pos)
+                event(q.QEvent.Type.MouseMove, direction*21, q.Qt.MouseButton.NoButton, q.Qt.MouseButton.LeftButton)
+                self.assertEqual(bar.pos(), start_pos+direction.toPoint())
+                event(q.QEvent.Type.MouseMove, direction*40, q.Qt.MouseButton.NoButton, q.Qt.MouseButton.LeftButton)
+                self.assertEqual(bar.pos(), start_pos+(direction*20).toPoint())
+                event(q.QEvent.Type.MouseMove, direction*25, q.Qt.MouseButton.NoButton, q.Qt.MouseButton.LeftButton)
+                self.assertEqual(bar.pos(), start_pos+(direction*5).toPoint())
+                event(q.QEvent.Type.MouseButtonRelease, direction*25, q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.NoButton)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

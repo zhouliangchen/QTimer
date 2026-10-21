@@ -39,7 +39,6 @@
   "stage_font": "微软雅黑",
   "stage_font_size": 26,
   "bg_color": "#141414",
-  "global_transparency": 0,
   "bg_transparency": 27,
   "font_transparency": 0,
   "shortcut_toggle": "Ctrl+Space",
