@@ -21,7 +21,7 @@ from color_sampling import inverse_background, sample_underlay, set_capture_excl
 
 APP_ID = "QTimer"  # Stable storage/instance identity preserves existing installations.
 __app_name__ = "超智能计时器"
-__version__ = "1.7.2-guide.1"
+__version__ = "1.7.3-guide.1"
 FORK_URL = "https://github.com/zhouliangchen/QTimer"
 __author__ = "QwejayHuang"
 __company__ = "QwejayHuang"
@@ -1184,7 +1184,7 @@ class SettingsWindow(QDialog):
         handle.setAccessibleName("拖动或缩放设置窗口")
         handle.setToolTip("拖动标题行移动窗口，上沿或右沿可缩放；双击最大化或还原")
         handle_layout = QHBoxLayout(handle)
-        handle_layout.setContentsMargins(0, 8, 0, 0)
+        handle_layout.setContentsMargins(0, 18, 0, 0)
         handle_layout.addWidget(self.page_title)
         handle_layout.addStretch()
         handle_layout.addWidget(self.btn_close, 0, Qt.AlignmentFlag.AlignTop)
@@ -1281,7 +1281,7 @@ class SettingsWindow(QDialog):
 
     def _change_page(self, idx: int) -> None:
         titles = [
-            ("流程配置", "规划计时环节，安排放映联动与超时行为。"),
+            ("流程配置", ""),
             ("预警与声音", ""),
             ("外观与显示", ""),
             ("快捷操作", ""),
