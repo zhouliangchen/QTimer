@@ -16,11 +16,12 @@ from PySide6.QtCore import *
 from PySide6.QtGui import *
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import *
-from settings_ui import AppearancePreview, OptionCheckBox, SETTINGS_STYLE, ToggleSwitch
+from settings_ui import AppearancePreview, OptionCheckBox, SETTINGS_STYLE, ToggleSwitch, SettingsDragHandle
+from color_sampling import inverse_background, sample_underlay, set_capture_excluded
 
 APP_ID = "QTimer"  # Stable storage/instance identity preserves existing installations.
 __app_name__ = "超智能计时器"
-__version__ = "1.6.1-guide.1"
+__version__ = "1.7.0-guide.1"
 __author__ = "QwejayHuang"
 __company__ = "QwejayHuang"
 __description__ = "超智能计时器 · 演示与会议计时"
@@ -39,6 +40,20 @@ def get_app_dir() -> str:
 
 def resource_path(name: str) -> str:
     return os.path.join(getattr(sys, '_MEIPASS', get_app_dir()), name)
+
+
+OVERTIME_PRESETS = {
+    "overdue-red": ("已超时 · 红色", "overdue-red.png"),
+    "time-up-blue": ("时间到 · 蓝色", "time-up-blue.png"),
+    "please-finish-amber": ("请结束 · 琥珀色", "please-finish-amber.png"),
+}
+
+
+def timeout_image_path(value: str) -> str:
+    if value.startswith("preset:"):
+        preset = OVERTIME_PRESETS.get(value.removeprefix("preset:"))
+        return resource_path("assets/overtime/" + preset[1]) if preset else ""
+    return value
 
 def get_config_path() -> str:
     loc = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
@@ -269,10 +284,12 @@ class Config:
         self.prevent_offscreen: bool = True
         self.show_stage_label: bool = True
         self.ppt_auto_start: bool = True
+        self.ppt_auto_pause: bool = True
         self.double_click_toggle: bool = True
         self.stages: list[Stage] = [Stage("说课时间", 5, "分", False), Stage("答辩时间", 2, "分", False)]
         self.alerts: list[Alert] = [Alert(30, "#ffaa00", True), Alert(10, "#ff4444", True)]
         self.color: str = "#ffffff"
+        self.auto_text_color: bool = False
         self.font: str = "微软雅黑"
         self.font_size: int = 32
         self.stage_font: str = "微软雅黑"
@@ -299,10 +316,12 @@ class Config:
             "prevent_offscreen": self.prevent_offscreen,
             "show_stage_label": self.show_stage_label,
             "ppt_auto_start": self.ppt_auto_start,
+            "ppt_auto_pause": self.ppt_auto_pause,
             "double_click_toggle": self.double_click_toggle,
             "stages": [asdict(s) for s in self.stages],
             "alerts": [asdict(a) for a in self.alerts],
             "color": self.color,
+            "auto_text_color": self.auto_text_color,
             "font": self.font,
             "font_size": self.font_size,
             "stage_font": self.stage_font,
@@ -332,6 +351,9 @@ class Config:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 d = json.load(f)
             if not isinstance(d, dict): return
+            # The previous single switch controlled both actions.
+            if "ppt_auto_pause" not in d and "ppt_auto_start" in d:
+                d["ppt_auto_pause"] = d["ppt_auto_start"]
             
             for key in self.__dict__.keys():
                 if key in d and not key.startswith('_'):
@@ -493,6 +515,11 @@ class FloatBar(QWidget):
         self._adjusting_geometry = False
         self._overtime = None
         self._text_color = "#ffffff"
+        self._auto_text_color = False
+        self._auto_colors = ["#ffffff", "#ffffff"]
+        self._capture_excluded = False
+        self._sampling_hwnd = None
+        self._alert_active = False
         self._font_family = "微软雅黑"
         self._font_size = 32
         self._stage_font_family = "微软雅黑"
@@ -529,6 +556,9 @@ class FloatBar(QWidget):
         self._hide_timer.timeout.connect(self._do_hide_anim)
         self._build_ui()
         self._update_size()
+        self._color_sample_timer = QTimer(self)
+        self._color_sample_timer.setInterval(200)
+        self._color_sample_timer.timeout.connect(self._update_auto_colors)
 
     @Property(int)
     def bar_width(self) -> int:
@@ -631,8 +661,10 @@ class FloatBar(QWidget):
 
     def apply_style(self, color: str, font: str, size: int, stage_font: str, stage_size: int,
                     opacity: float, bg_color: QColor, always_on_top: bool,
-                    show_stage_label: bool, prevent_offscreen: bool, font_transparency: int, ui_scale: int = 100) -> None:
+                    show_stage_label: bool, prevent_offscreen: bool, font_transparency: int, ui_scale: int = 100,
+                    auto_text_color: bool = False) -> None:
         self._text_color = color
+        self._auto_text_color = auto_text_color
         self._font_family = font
         self._stage_font_family = stage_font
         self._bg_color = bg_color
@@ -674,11 +706,47 @@ class FloatBar(QWidget):
                 self.show()
         self._refresh_labels()
         self._update_size()
+        self._sync_capture_exclusion()
+        if auto_text_color:
+            self._color_sample_timer.start()
+            self._update_auto_colors()
+        else:
+            self._color_sample_timer.stop()
         self.update()
 
+    def _sync_capture_exclusion(self) -> None:
+        needed = self._auto_text_color and self._bg_color.alpha() < 255
+        hwnd = int(self.winId())
+        if self._sampling_hwnd != hwnd or needed != self._capture_excluded:
+            self._capture_excluded = needed and set_capture_excluded(hwnd, True)
+            if not needed:
+                set_capture_excluded(hwnd, False)
+            self._sampling_hwnd = hwnd
+
+    def _update_auto_colors(self) -> None:
+        if not self._auto_text_color or not self.isVisible():
+            return
+        labels = (self.lbl_stage, self.lbl_time)
+        regions = [QRect(label.mapTo(self, QPoint(0, 0)), label.size()) for label in labels]
+        if self._bg_color.alpha() < 255:
+            underlay = (sample_underlay(int(self.winId()), regions, self.devicePixelRatioF())
+                        if self._capture_excluded else None)
+        else:
+            underlay = [QColor('white')] * 2
+        if underlay is None:
+            # Retain the last valid color if the desktop temporarily cannot be read.
+            return
+        colors = [inverse_background(self._bg_color, color).name() for color in underlay]
+        if colors != self._auto_colors:
+            self._auto_colors = colors
+            self._refresh_labels()
+
     def _refresh_labels(self, stage_color: str = None, time_color: str = None) -> None:
-        sc = stage_color or self._text_color
-        tc = time_color or self._text_color
+        bases = self._auto_colors if self._auto_text_color else [self._text_color] * 2
+        if self._alert_active and (not self._flash_timer.isActive() or self._flash_state):
+            bases = [self._flash_color] * 2
+        sc = stage_color or bases[0]
+        tc = time_color or bases[1]
         opacity_pct = max(0, min(100, 100 - self._font_transparency))
         rgba_sc = get_rgba_color(sc, opacity_pct)
         rgba_tc = get_rgba_color(tc, opacity_pct)
@@ -785,6 +853,7 @@ class FloatBar(QWidget):
         self.btn_toggle.setIcon(get_svg_icon(icon_name, icon_inner))
 
     def start_flash(self, color: str, auto_stop_ms: int = 3000) -> None:
+        self._alert_active = True
         self._flash_stop_timer.stop()
         self._flash_color = color
         self._flash_state = False
@@ -806,6 +875,7 @@ class FloatBar(QWidget):
             self.start_flash(color, 0 if keep_flashing else 3000)
 
     def reset_alert(self) -> None:
+        self._alert_active = False
         self._flash_stop_timer.stop()
         self._flash_timer.stop()
         self._flash_color = self._text_color
@@ -815,7 +885,7 @@ class FloatBar(QWidget):
         self._overtime = stage
         self.lbl_time.clear()
         if stage.timeout_display == "image":
-            pixmap = QPixmap(stage.timeout_image)
+            pixmap = QPixmap(timeout_image_path(stage.timeout_image))
             if not pixmap.isNull():
                 height = max(20, int(self._font_size + 8 * self._ui_scale / 100))
                 pixmap = pixmap.scaled(300, height, Qt.AspectRatioMode.KeepAspectRatio,
@@ -831,8 +901,7 @@ class FloatBar(QWidget):
 
     def _do_flash(self) -> None:
         self._flash_state = not self._flash_state
-        c = self._flash_color if self._flash_state else self._text_color
-        self._refresh_labels(stage_color=c, time_color=c)
+        self._refresh_labels()
 
     def enterEvent(self, e) -> None:
         self._update_drawer_direction()
@@ -985,12 +1054,14 @@ class FloatBar(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         if hasattr(self, '_target_opacity'):
             self.setWindowOpacity(self._target_opacity)
+        if hasattr(self, '_sampling_hwnd'):
+            self._sync_capture_exclusion()
 
 class SettingsWindow(QDialog):
     preview_requested = Signal()
     
     _SS = SETTINGS_STYLE
-    PREVIEW_FIELDS = ("show_stage_label", "always_on_top", "prevent_offscreen", "color", "bg_color",
+    PREVIEW_FIELDS = ("show_stage_label", "always_on_top", "prevent_offscreen", "color", "auto_text_color", "bg_color",
                       "bg_transparency", "font_transparency", "font", "font_size", "stage_font",
                       "stage_font_size", "ui_scale")
 
@@ -999,14 +1070,15 @@ class SettingsWindow(QDialog):
         self._original_config = config
         self.config = copy.deepcopy(config)
         self._backup_attrs = copy.deepcopy(config.__dict__)
-        self.setWindowTitle(f"{__app_name__} 设置")
+        self.setWindowTitle("设置")
         self.resize(1040, 790)
         self.setMinimumSize(920, 650)
         self.setObjectName("settingsDialog")
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setStyleSheet(self._SS)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+        self.setWindowFlags((self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+                            | Qt.WindowType.FramelessWindowHint)
         self._stage_rows = []
         self._alert_rows = []
         self._build_ui()
@@ -1014,7 +1086,25 @@ class SettingsWindow(QDialog):
         self._connect_live_preview_triggers()
 
     def _build_ui(self) -> None:
-        root = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        handle = SettingsDragHandle()
+        handle.setAccessibleName("拖动设置窗口")
+        handle.setFixedHeight(30)
+        handle_layout = QHBoxLayout(handle)
+        handle_layout.setContentsMargins(0, 0, 8, 0)
+        handle_layout.addStretch()
+        self.btn_close = QPushButton("×")
+        self.btn_close.setAccessibleName("关闭设置")
+        self.btn_close.setFixedSize(30, 26)
+        self.btn_close.setProperty("role", "quiet")
+        self.btn_close.setStyleSheet("QPushButton { padding:0; min-height:0; font-size:22px; border:none; border-radius:5px; color:#718097; background:transparent; } QPushButton:hover { color:#b5303b; background:#fee8eb; }")
+        self.btn_close.clicked.connect(self.reject)
+        handle_layout.addWidget(self.btn_close)
+        outer.addWidget(handle)
+        root = QHBoxLayout()
+        outer.addLayout(root, 1)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         sidebar_panel = QWidget()
@@ -1046,10 +1136,6 @@ class SettingsWindow(QDialog):
         version = QLabel(f"版本 {__version__}")
         version.setObjectName("settingsHint")
         sidebar.addWidget(version)
-        copyright = QLabel('<a href="https://github.com/Qwejay/QTimer" style="color:#8b99ac; text-decoration:none;">基于 QTimer · QwejayHuang</a>')
-        copyright.setOpenExternalLinks(True)
-        copyright.setStyleSheet("font-size:10px;")
-        sidebar.addWidget(copyright)
         root.addWidget(sidebar_panel)
         content = QWidget()
         body = QVBoxLayout(content)
@@ -1068,9 +1154,10 @@ class SettingsWindow(QDialog):
         self.pages.addWidget(self._build_page_appearance())
         self.pages.addWidget(self._build_page_shortcuts())
         body.addWidget(self.pages, 1)
-        self.status_label = QLabel("外观更改即时预览，保存后应用全部设置。")
+        self.status_label = QLabel()
         self.status_label.setObjectName("settingsStatus")
         self.status_label.setWordWrap(True)
+        self.status_label.hide()
         body.addWidget(self.status_label)
         actions = QHBoxLayout()
         actions.setSpacing(10)
@@ -1088,6 +1175,7 @@ class SettingsWindow(QDialog):
         self.btn_save.setMinimumWidth(112)
         self.btn_save.clicked.connect(self._accept_validated)
         actions.addWidget(self.btn_save)
+        actions.addWidget(QSizeGrip(self))
         body.addLayout(actions)
         root.addWidget(content, 1)
         self.sidebar.currentRowChanged.connect(self._change_page)
@@ -1104,13 +1192,14 @@ class SettingsWindow(QDialog):
     def _change_page(self, idx: int) -> None:
         titles = [
             ("流程配置", "规划计时环节，安排放映联动与超时行为。"),
-            ("预警与声音", "在关键时间节点提醒，专注每一次演示。"),
-            ("外观与显示", "调整色彩、通透度与字体，让计时信息清晰可见。"),
-            ("快捷操作", "通过键盘控制计时，无需离开当前演示。"),
+            ("预警与声音", ""),
+            ("外观与显示", ""),
+            ("快捷操作", ""),
         ]
         self.pages.setCurrentIndex(idx)
         self.page_title.setText(titles[idx][0])
         self.page_description.setText(titles[idx][1])
+        self.page_description.setVisible(bool(titles[idx][1]))
 
     def _make_setting_row(self, title: str, subtitle: str, control: QWidget) -> QWidget:
         row = QWidget()
@@ -1200,12 +1289,14 @@ class SettingsWindow(QDialog):
         self.switch_show_label = ToggleSwitch()
         self.switch_auto_advance = ToggleSwitch()
         self.switch_ppt_auto_start = ToggleSwitch()
+        self.switch_ppt_auto_pause = ToggleSwitch()
         self.switch_double_click = ToggleSwitch()
         behav_lay = QVBoxLayout()
         behav_lay.setSpacing(12)
         behav_lay.addWidget(self._make_setting_row("显示环节名称", "在主悬浮球中同步显示各小节文本标题", self.switch_show_label))
         behav_lay.addWidget(self._make_setting_row("自动进入下一环节", "关闭后，到期停留在当前环节，需手动切换；开启后自动切换并继续计时", self.switch_auto_advance))
-        behav_lay.addWidget(self._make_setting_row("PPT放映联动", "当检测到幻灯片全屏放映时，自动开始计时", self.switch_ppt_auto_start))
+        behav_lay.addWidget(self._make_setting_row("PPT放映自动开始/恢复计时", "进入 PowerPoint / WPS 全屏放映时生效", self.switch_ppt_auto_start))
+        behav_lay.addWidget(self._make_setting_row("退出PPT自动暂停计时", "退出全屏放映时生效，可独立开关", self.switch_ppt_auto_pause))
         behav_lay.addWidget(self._make_setting_row("双击快捷操作", "双击悬浮窗空白区域快速进行开始/暂停", self.switch_double_click))
         lay.addWidget(self._make_card("行为习惯", behav_lay))
         list_lay = QVBoxLayout()
@@ -1284,6 +1375,9 @@ class SettingsWindow(QDialog):
         layout.addWidget(self._make_card("外观预览", preview_layout))
         colors = QVBoxLayout()
         colors.setSpacing(12)
+        self.switch_auto_text_color = ToggleSwitch()
+        self.switch_auto_text_color.setToolTip("透明背景自动取色需要 Windows 10 2004 或更新版本。\n该模式会在部分系统截图和录屏中隐藏计时条；不透明背景不受影响。")
+        colors.addWidget(self._make_setting_row("自动文字颜色", "实时读取文字背后的颜色并取反，包含背景通透度的影响", self.switch_auto_text_color))
         self._color_preview = QPushButton()
         self._color_preview.setMinimumWidth(140)
         self._color_preview.clicked.connect(lambda: self._pick_color(self._color_preview, "_cur_color"))
@@ -1407,6 +1501,7 @@ class SettingsWindow(QDialog):
             self.switch_auto_advance.setChecked(source.auto_advance)
             self.switch_show_label.setChecked(source.show_stage_label)
             self.switch_ppt_auto_start.setChecked(source.ppt_auto_start)
+            self.switch_ppt_auto_pause.setChecked(source.ppt_auto_pause)
             self.switch_double_click.setChecked(source.double_click_toggle)
             for s in source.stages:
                 self._add_stage_row(**asdict(s))
@@ -1421,6 +1516,8 @@ class SettingsWindow(QDialog):
             self.switch_always_on_top.setChecked(source.always_on_top)
             self.switch_prevent_offscreen.setChecked(source.prevent_offscreen)
             self._cur_color = source.color
+            self.switch_auto_text_color.setChecked(source.auto_text_color)
+            self._color_preview.setEnabled(not source.auto_text_color)
             self._set_color_preview(self._color_preview, self._cur_color)
             self._cur_bg_color = source.bg_color
             self._set_color_preview(self._bg_color_preview, self._cur_bg_color)
@@ -1502,14 +1599,44 @@ class SettingsWindow(QDialog):
         text_edit.setPlaceholderText("已超时")
         grid.addWidget(text_edit, 1, 0, 1, 3)
         image_panel = QWidget()
-        image_layout = QHBoxLayout(image_panel)
+        image_layout = QVBoxLayout(image_panel)
         image_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout = QHBoxLayout()
+        image_preset = QComboBox()
+        image_preset.addItem("自定义图片", "")
+        for key, (title, filename) in OVERTIME_PRESETS.items():
+            value = "preset:" + key
+            image_preset.addItem(QIcon(timeout_image_path(value)), title, value)
+        image_preset.setAccessibleName("超时图片来源")
+        image_preset.setCurrentIndex(max(0, image_preset.findData(timeout_image)))
         image_edit = QLineEdit(timeout_image)
         image_edit.setReadOnly(True)
         image_edit.setPlaceholderText("选择超时后显示的图片")
         image_pick = QPushButton("选择图片…")
-        image_layout.addWidget(image_edit, 1)
-        image_layout.addWidget(image_pick)
+        source_layout.addWidget(image_preset, 1)
+        source_layout.addWidget(image_pick)
+        image_layout.addLayout(source_layout)
+        image_layout.addWidget(image_edit)
+        image_preview = QLabel()
+        image_preview.setAccessibleName("超时图片预览")
+        image_preview.setMinimumHeight(48)
+        image_layout.addWidget(image_preview)
+        def refresh_image_preview():
+            value = image_edit.text()
+            image_edit.setVisible(not value.startswith("preset:"))
+            pixmap = QPixmap(timeout_image_path(value))
+            image_preview.clear()
+            if not pixmap.isNull():
+                image_preview.setPixmap(pixmap.scaled(210, 64, Qt.AspectRatioMode.KeepAspectRatio,
+                                                     Qt.TransformationMode.SmoothTransformation))
+        def choose_preset():
+            value = image_preset.currentData()
+            if value or image_edit.text().startswith("preset:"):
+                image_edit.setText(value)
+            refresh_image_preview()
+        image_preset.currentIndexChanged.connect(choose_preset)
+        image_edit.textChanged.connect(refresh_image_preview)
+        refresh_image_preview()
         grid.addWidget(image_panel, 2, 0, 1, 3)
         hint = QLabel("关闭“自动进入下一环节”可保留超时显示；退出放映不会关闭文稿或软件。")
         hint.setWordWrap(True)
@@ -1519,6 +1646,7 @@ class SettingsWindow(QDialog):
             path, _ = QFileDialog.getOpenFileName(self, "选择超时图片", image_edit.text(),
                                                  "图片 (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.svg)")
             if path:
+                image_preset.setCurrentIndex(0)
                 image_edit.setText(path)
         image_pick.clicked.connect(select_image)
         def update_timeout_controls():
@@ -1530,7 +1658,8 @@ class SettingsWindow(QDialog):
         update_timeout_controls()
         card.addWidget(overtime)
         row.update(timeout_display=display, timeout_text=text_edit,
-                   timeout_image=image_edit, timeout_close_show=close_show)
+                   timeout_image=image_edit, timeout_close_show=close_show,
+                   timeout_preset=image_preset, timeout_image_preview=image_preview)
         self._stage_rows.append(row)
         self._stage_vlay.addWidget(row_widget)
 
@@ -1664,6 +1793,7 @@ class SettingsWindow(QDialog):
         self._populate()
         self._trigger_live_preview()
         self.status_label.setText("已恢复默认值。保存设置后生效，取消可撤销。")
+        self.status_label.show()
 
     def _validate_shortcuts(self) -> bool:
         mapping = {
@@ -1688,6 +1818,7 @@ class SettingsWindow(QDialog):
         self.switch_show_label.toggled.connect(self._trigger_live_preview)
         self.switch_always_on_top.toggled.connect(self._trigger_live_preview)
         self.switch_prevent_offscreen.toggled.connect(self._trigger_live_preview)
+        self.switch_auto_text_color.toggled.connect(self._trigger_live_preview)
         self._bg_op_slider.valueChanged.connect(self._trigger_live_preview)
         self._font_trans_slider.valueChanged.connect(self._trigger_live_preview)
         self._size_slider.valueChanged.connect(self._trigger_live_preview)
@@ -1703,6 +1834,8 @@ class SettingsWindow(QDialog):
         self.config.always_on_top = self.switch_always_on_top.isChecked()
         self.config.prevent_offscreen = self.switch_prevent_offscreen.isChecked()
         self.config.color = self._cur_color
+        self.config.auto_text_color = self.switch_auto_text_color.isChecked()
+        self._color_preview.setEnabled(not self.config.auto_text_color)
         self.config.bg_color = self._cur_bg_color
         self.config.bg_transparency = self._bg_op_slider.value()
         self.config.font_transparency = self._font_trans_slider.value()
@@ -1728,7 +1861,7 @@ class SettingsWindow(QDialog):
         for row in self._stage_rows:
             stage = self._stage_from_row(row)
             if not stage.count_up and stage.timeout_display == "image":
-                if not QImageReader(stage.timeout_image).canRead():
+                if not QImageReader(timeout_image_path(stage.timeout_image)).canRead():
                     QMessageBox.warning(self, "图片不可用", "请选择有效的超时图片，或改为显示文字。")
                     return
         self.accept()
@@ -1737,6 +1870,7 @@ class SettingsWindow(QDialog):
         self.config.auto_advance = self.switch_auto_advance.isChecked()
         self.config.show_stage_label = self.switch_show_label.isChecked()
         self.config.ppt_auto_start = self.switch_ppt_auto_start.isChecked()
+        self.config.ppt_auto_pause = self.switch_ppt_auto_pause.isChecked()
         self.config.double_click_toggle = self.switch_double_click.isChecked()
         self.config.global_sound = self.switch_global_sound.isChecked()
         self.config.countdown_10s_sound = self.switch_10s_sound.isChecked()
@@ -1747,6 +1881,7 @@ class SettingsWindow(QDialog):
         self.config.stages = [self._stage_from_row(r) for r in self._stage_rows]
         self.config.alerts = [Alert(r["spin"].value(), r["color"], r["chk_sound"].isChecked(), r["chk_flash"].isChecked()) for r in self._alert_rows]
         self.config.color = self._cur_color
+        self.config.auto_text_color = self.switch_auto_text_color.isChecked()
         self.config.bg_color = self._cur_bg_color
         self.config.bg_transparency = self._bg_op_slider.value()
         self.config.font_transparency = self._font_trans_slider.value()
@@ -1806,7 +1941,10 @@ class App(QObject):
         self.float_bar.show()
 
     def _check_ppt_status(self) -> None:
-        if not self.config.ppt_auto_start:
+        if not (self.config.ppt_auto_start or self.config.ppt_auto_pause):
+            self._ppt_was_active = False
+            self._ppt_stable_active_count = 0
+            self._current_ppt_session_paused_by_user = False
             return
         is_active = is_ppt_slideshow_active()
         if is_active:
@@ -1814,10 +1952,10 @@ class App(QObject):
             if self._ppt_stable_active_count >= 2 and not self._ppt_was_active:
                 self._ppt_was_active = True
                 self._current_ppt_session_paused_by_user = False
-                if self.controller.paused and self.controller._remaining_float > 0:
+                if self.config.ppt_auto_start and self.controller.paused and self.controller._remaining_float > 0:
                     self.controller.toggle_pause()
             elif self._ppt_stable_active_count >= 2:
-                if self.controller.paused and self.controller._remaining_float > 0:
+                if self.config.ppt_auto_start and self.controller.paused and self.controller._remaining_float > 0:
                     if not self._current_ppt_session_paused_by_user:
                         self.controller.toggle_pause()
         else:
@@ -1825,7 +1963,7 @@ class App(QObject):
             if self._ppt_was_active:
                 self._ppt_was_active = False
                 self._current_ppt_session_paused_by_user = False
-                if not self.controller.paused:
+                if self.config.ppt_auto_pause and not self.controller.paused:
                     self.controller.toggle_pause()
 
     def _on_user_interaction(self):
@@ -1897,7 +2035,7 @@ class App(QObject):
         opacity_float = 1.0
         self.float_bar.apply_style(c.color, c.font, c.font_size, c.stage_font, c.stage_font_size,
                                    opacity_float, c.bg_qcolor(), c.always_on_top, c.show_stage_label, 
-                                   c.prevent_offscreen, c.font_transparency, c.ui_scale)
+                                   c.prevent_offscreen, c.font_transparency, c.ui_scale, c.auto_text_color)
 
     def _apply_shortcuts(self) -> None:
         for sc in self._shortcuts:

@@ -2,6 +2,18 @@
 from PySide6.QtCore import Property, QEasingCurve, QPropertyAnimation, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import QCheckBox, QSizePolicy, QWidget
+from color_sampling import inverse_background
+
+
+class SettingsDragHandle(QWidget):
+    """Move a frameless settings dialog using the operating system drag loop."""
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle = self.window().windowHandle()
+            if handle and handle.startSystemMove():
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
 SETTINGS_STYLE = """
 QDialog#settingsDialog { background:#f3f6fb; color:#172b49; }
@@ -185,7 +197,8 @@ class AppearancePreview(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(cfg.bg_qcolor())
         painter.drawRoundedRect(box, 13, 13)
-        foreground = QColor(cfg.color)
+        foreground = (inverse_background(cfg.bg_qcolor(), QColor('#f0f4fa'))
+                      if cfg.auto_text_color else QColor(cfg.color))
         foreground.setAlphaF(max(0, min(1, (100-cfg.font_transparency)/100)))
         painter.setPen(foreground)
         if name:

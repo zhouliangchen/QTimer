@@ -325,5 +325,135 @@ class FeatureTests(unittest.TestCase):
                 self.assertEqual(bar.pos(), start_pos+(direction*5).toPoint())
                 event(q.QEvent.Type.MouseButtonRelease, direction*25, q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.NoButton)
 
+    def test_ppt_start_and_exit_pause_are_independent(self):
+        instance = self.instance()
+        for start in (False, True):
+            for pause in (False, True):
+                with self.subTest(start=start, pause=pause):
+                    instance.config.ppt_auto_start = start
+                    instance.config.ppt_auto_pause = pause
+                    instance.controller.stop()
+                    instance._ppt_was_active = False
+                    instance._ppt_stable_active_count = 0
+                    with patch.object(q, 'is_ppt_slideshow_active', return_value=True):
+                        instance._check_ppt_status()
+                        instance._check_ppt_status()
+                    self.assertEqual(instance.controller.paused, not start)
+                    if instance.controller.paused:
+                        instance.controller.toggle_pause()
+                    with patch.object(q, 'is_ppt_slideshow_active', return_value=False):
+                        instance._check_ppt_status()
+                    self.assertEqual(instance.controller.paused, pause)
+
+    def test_ppt_manual_pause_survives_detection_and_resumes_next_show(self):
+        instance = self.instance()
+        instance.config.ppt_auto_start = True
+        with patch.object(q, 'is_ppt_slideshow_active', return_value=True):
+            instance._check_ppt_status()
+            instance._check_ppt_status()
+            instance._handle_user_action(instance.controller.toggle_pause)
+            instance._check_ppt_status()
+            self.assertTrue(instance.controller.paused)
+        with patch.object(q, 'is_ppt_slideshow_active', return_value=False):
+            instance._check_ppt_status()
+        with patch.object(q, 'is_ppt_slideshow_active', return_value=True):
+            instance._check_ppt_status()
+            instance._check_ppt_status()
+        self.assertFalse(instance.controller.paused)
+
+    def test_old_ppt_switch_migrates_both_actions_and_new_values_roundtrip(self):
+        for enabled in (False, True):
+            Path(q.CONFIG_PATH).write_text(json.dumps({'ppt_auto_start': enabled}), encoding='utf-8')
+            config = q.Config()
+            config.load()
+            self.assertEqual(config.ppt_auto_pause, enabled)
+        config.ppt_auto_start = False
+        config.ppt_auto_pause = True
+        config.auto_text_color = True
+        config.save()
+        restored = q.Config()
+        restored.load()
+        self.assertFalse(restored.ppt_auto_start)
+        self.assertTrue(restored.ppt_auto_pause)
+        self.assertTrue(restored.auto_text_color)
+
+    def test_presets_preview_render_and_relocatable_identifiers(self):
+        dialog = q.SettingsWindow(self.config)
+        self.widgets.append(dialog)
+        row = dialog._stage_rows[0]
+        row['timeout_display'].setCurrentIndex(row['timeout_display'].findData('image'))
+        bar = self.bar()
+        for key in q.OVERTIME_PRESETS:
+            value = 'preset:' + key
+            row['timeout_preset'].setCurrentIndex(row['timeout_preset'].findData(value))
+            self.assertFalse(row['timeout_image_preview'].pixmap().isNull())
+            stage = dialog._stage_from_row(row)
+            self.assertEqual(stage.timeout_image, value)
+            self.config.stages = [stage]
+            self.config.save()
+            restored = q.Config()
+            restored.load()
+            self.assertEqual(restored.stages[0].timeout_image, value)
+            bar.show_overtime(restored.stages[0])
+            self.assertFalse(bar.lbl_time.pixmap().isNull())
+            with patch.object(q.sys, '_MEIPASS', self.temp.name, create=True):
+                self.assertTrue(q.timeout_image_path(value).startswith(self.temp.name))
+
+    def test_auto_colors_composite_underlay_and_preserve_alerts(self):
+        bar = self.bar()
+        bar.update_display('stage', 60)
+        bar.show()
+        with patch.object(q, 'set_capture_excluded', return_value=True), patch.object(q, 'sample_underlay', return_value=[q.QColor('white'), q.QColor('black')]):
+            bar.apply_style('#123456', 'Arial', 32, 'Arial', 18, 1,
+                            q.QColor(0, 0, 0, 128), True, True, True, 0, 100, True)
+            bar._update_auto_colors()
+            self.assertEqual(bar._auto_colors, ['#808080', '#ffffff'])
+            bar._update_auto_colors()
+            self.assertEqual(bar._auto_colors, ['#808080', '#ffffff'])
+            bar.start_flash('#ff0000', 0)
+            bar._do_flash()
+            bar._update_auto_colors()
+            self.assertIn('255,0,0', bar.lbl_time.styleSheet().replace(' ', ''))
+            bar.reset_alert()
+            self.assertIn('255,255,255', bar.lbl_time.styleSheet().replace(' ', ''))
+        previous = list(bar._auto_colors)
+        with patch.object(q, 'sample_underlay', return_value=None):
+            bar._update_auto_colors()
+        self.assertEqual(bar._auto_colors, previous)
+
+    def test_auto_color_preview_cancel_and_defaults(self):
+        instance = self.instance()
+        instance._open_settings()
+        dialog = instance._settings_window
+        dialog.switch_auto_text_color.setChecked(True)
+        self.assertTrue(instance.config.auto_text_color)
+        self.assertFalse(dialog._color_preview.isEnabled())
+        dialog.reject()
+        self.assertFalse(instance.config.auto_text_color)
+        instance._open_settings()
+        dialog = instance._settings_window
+        dialog.switch_auto_text_color.setChecked(True)
+        dialog._restore_defaults()
+        self.assertFalse(dialog.switch_auto_text_color.isChecked())
+        self.assertTrue(dialog._color_preview.isEnabled())
+        dialog.switch_ppt_auto_start.setChecked(False)
+        dialog.switch_ppt_auto_pause.setChecked(True)
+        saved = dialog.get_config()
+        self.assertFalse(saved.ppt_auto_start)
+        self.assertTrue(saved.ppt_auto_pause)
+
+    def test_settings_are_frameless_and_requested_notes_are_removed(self):
+        dialog = q.SettingsWindow(self.config)
+        self.widgets.append(dialog)
+        self.assertTrue(dialog.windowFlags() & q.Qt.WindowType.FramelessWindowHint)
+        self.assertIsNotNone(dialog.findChild(q.SettingsDragHandle))
+        self.assertIsNotNone(dialog.findChild(q.QSizeGrip))
+        for index in (1, 2, 3):
+            dialog._change_page(index)
+            self.assertTrue(dialog.page_description.isHidden())
+        texts = ' '.join(label.text() for label in dialog.findChildren(q.QLabel))
+        for note in ('基于 QTimer', '在关键时间节点提醒', '外观更改即时预览', '调整色彩、通透度与字体', '通过键盘控制计时'):
+            self.assertNotIn(note, texts)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
