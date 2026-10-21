@@ -7,13 +7,44 @@ from color_sampling import inverse_background
 
 class SettingsDragHandle(QWidget):
     """Move a frameless settings dialog using the operating system drag loop."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+
+    def _resize_edges(self, position):
+        edges = Qt.Edge(0)
+        if position.y() <= 5:
+            edges |= Qt.Edge.TopEdge
+        if position.x() >= self.width() - 5:
+            edges |= Qt.Edge.RightEdge
+        return edges
+
+    def mouseMoveEvent(self, event):
+        edges = self._resize_edges(event.position())
+        cursor = (Qt.CursorShape.SizeBDiagCursor if edges == (Qt.Edge.TopEdge | Qt.Edge.RightEdge)
+                  else Qt.CursorShape.SizeVerCursor if edges & Qt.Edge.TopEdge
+                  else Qt.CursorShape.SizeHorCursor if edges & Qt.Edge.RightEdge
+                  else Qt.CursorShape.ArrowCursor)
+        self.setCursor(cursor)
+        super().mouseMoveEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             handle = self.window().windowHandle()
-            if handle and handle.startSystemMove():
+            edges = self._resize_edges(event.position())
+            started = handle and (handle.startSystemResize(edges) if edges else handle.startSystemMove())
+            if started:
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            window = self.window()
+            window.showNormal() if window.isMaximized() else window.showMaximized()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 SETTINGS_STYLE = """
 QDialog#settingsDialog { background:#f3f6fb; color:#172b49; }

@@ -21,7 +21,8 @@ from color_sampling import inverse_background, sample_underlay, set_capture_excl
 
 APP_ID = "QTimer"  # Stable storage/instance identity preserves existing installations.
 __app_name__ = "超智能计时器"
-__version__ = "1.7.0-guide.1"
+__version__ = "1.7.1-guide.1"
+FORK_URL = "https://github.com/zhouliangchen/QTimer"
 __author__ = "QwejayHuang"
 __company__ = "QwejayHuang"
 __description__ = "超智能计时器 · 演示与会议计时"
@@ -512,6 +513,12 @@ class FloatBar(QWidget):
         self._drag_pos = None
         self._drag_axes = {}
         self._drawer_left = False
+        self._drawer_target_left = False
+        self._drawer_reveal = 0.0
+        self._drawer_goal = 0.0
+        self._side_switching = False
+        self._drawer_space = 0
+        self._geometry_ready = False
         self._adjusting_geometry = False
         self._overtime = None
         self._text_color = "#ffffff"
@@ -542,15 +549,13 @@ class FloatBar(QWidget):
         self._flash_stop_timer = QTimer(self)
         self._flash_stop_timer.setSingleShot(True)
         self._flash_stop_timer.timeout.connect(self.stop_flash)
-        self._width_anim = QPropertyAnimation(self, b"bar_width")
+        self._width_anim = QPropertyAnimation(self, b"drawer_reveal")
         self._width_anim.setDuration(220)
         self._width_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._btn_opacity = QGraphicsOpacityEffect()
-        self._btn_anim = QPropertyAnimation(self._btn_opacity, b"opacity")
-        self._btn_anim.setDuration(220)
         self._anim_group = QParallelAnimationGroup(self)
         self._anim_group.addAnimation(self._width_anim)
-        self._anim_group.addAnimation(self._btn_anim)
+        self._anim_group.finished.connect(self._finish_drawer_animation)
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._do_hide_anim)
@@ -562,49 +567,107 @@ class FloatBar(QWidget):
 
     @Property(int)
     def bar_width(self) -> int:
-        return self.width()
+        return self._text_width + round(self._drawer_space * self._drawer_reveal)
 
     @bar_width.setter
     def bar_width(self, w: int) -> None:
-        right = self.geometry().right()
-        self._adjusting_geometry = True
-        self.setFixedWidth(w)
-        if self._drawer_left:
-            self.move(right - self.width() + 1, self.y())
-        self._adjusting_geometry = False
+        self.drawer_reveal = (w - self._text_width) / max(1, self._drawer_space)
+
+    @Property(float)
+    def drawer_reveal(self) -> float:
+        return self._drawer_reveal
+
+    @drawer_reveal.setter
+    def drawer_reveal(self, value: float) -> None:
+        self._drawer_reveal = max(0.0, min(1.0, value))
+        self._btn_opacity.setOpacity(self._drawer_reveal)
         self._position_canvas()
 
+    def content_position(self) -> QPoint:
+        return self.mapToGlobal(QPoint(self._drawer_space, 0))
+
+    def move_content(self, position: QPoint) -> None:
+        self.move(position.x() - self._drawer_space, position.y())
+
+    def _visible_rect(self) -> QRect:
+        extent = round(self._drawer_space * self._drawer_reveal)
+        return QRect(self._drawer_space - (extent if self._drawer_left else 0), 0,
+                     self._text_width + extent, self.height())
+
+    def visible_geometry(self) -> QRect:
+        rect = self._visible_rect()
+        return QRect(self.mapToGlobal(rect.topLeft()), rect.size())
+
     def _position_canvas(self) -> None:
-        self._canvas.move(self.width() - self._full_width if self._drawer_left else 0, 0)
+        if not self._geometry_ready:
+            return
+        # The native window and text never move/resize during drawer animation.
+        # Only the painted/hit-test region and the clipped button strip change.
+        extent = round(self._drawer_space * self._drawer_reveal)
+        button_width = self._btn_container.width()
+        gap = self._drawer_space - button_width
+        if self._drawer_left:
+            self._btn_container.move(self._drawer_space - extent, 0)
+            clip = QRect(0, 0, max(0, extent - gap), self.height())
+        else:
+            self._btn_container.move(self._drawer_space + self._text_width + extent - button_width, 0)
+            clip = QRect(self._drawer_space - extent, 0, max(0, extent - gap), self.height())
+        self._btn_container.setVisible(clip.width() > 0)
+        if clip.width() > 0:
+            self._btn_container.setMask(QRegion(clip))
+        self._text_container.raise_()
+        self.setMask(QRegion(self._visible_rect()))
+        self.update()
 
     def _update_drawer_direction(self) -> None:
         if not hasattr(self, '_text_container') or self._adjusting_geometry:
             return
-        content_left = self.x() + (self.width() - self._text_width if self._drawer_left else 0)
+        content_left = self.content_position().x()
         center = QPoint(content_left + self._text_width // 2, self.y() + self.height() // 2)
         screen = QApplication.screenAt(center) or self.screen()
         if not screen:
             return
         geometry = screen.availableGeometry()
         left = center.x() >= geometry.left() + geometry.width() * 2 / 3
-        if left == self._drawer_left:
+        if left == self._drawer_target_left:
             return
-        self._drawer_left = left
-        self._layout.setDirection(QBoxLayout.Direction.RightToLeft if left else QBoxLayout.Direction.LeftToRight)
-        self._layout.activate()
-        self._adjusting_geometry = True
-        self.move(content_left - (self.width() - self._text_width if left else 0), self.y())
-        self._adjusting_geometry = False
-        self._position_canvas()
+        self._drawer_target_left = left
+        if self._side_switching:
+            if left == self._drawer_left:
+                self._side_switching = False
+                self._animate_reveal(self._drawer_goal, 180)
+            return
+        if self.isVisible() and self._drawer_reveal > 0:
+            self._side_switching = True
+            self._animate_reveal(0.0, 140)
+        else:
+            self._drawer_left = left
+            self._position_canvas()
+
+    def _animate_reveal(self, goal: float, duration: int = 220) -> None:
+        self._anim_group.stop()
+        self._width_anim.setDuration(duration)
+        self._width_anim.setStartValue(self._drawer_reveal)
+        self._width_anim.setEndValue(goal)
+        self._anim_group.start()
+
+    def _finish_drawer_animation(self) -> None:
+        if self._side_switching:
+            self._side_switching = False
+            self._drawer_left = self._drawer_target_left
+            self._position_canvas()
+            if self._drawer_goal:
+                self._animate_reveal(self._drawer_goal, 180)
+
+    def _set_drawer_open(self, opened: bool) -> None:
+        self._drawer_goal = 1.0 if opened else 0.0
+        if not self._side_switching:
+            self._animate_reveal(self._drawer_goal)
 
     def _build_ui(self) -> None:
         self._canvas = QWidget(self)
         self._canvas.move(0, 0)
-        self._layout = QHBoxLayout(self._canvas)
-        self._layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(0)
-        self._text_container = QWidget()
+        self._text_container = QWidget(self._canvas)
         self._text_layout = QHBoxLayout(self._text_container)
         self._text_layout.setContentsMargins(18, 0, 18, 0)
         self._text_layout.setSpacing(0)
@@ -618,11 +681,7 @@ class FloatBar(QWidget):
         self._spacing_item = QSpacerItem(12, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._text_layout.addItem(self._spacing_item)
         self._text_layout.addWidget(self.lbl_time, 0, Qt.AlignmentFlag.AlignVCenter)
-        self._layout.addWidget(self._text_container, 0, Qt.AlignmentFlag.AlignVCenter)
-        
-        self._end_spacing_item = QSpacerItem(16, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._layout.addItem(self._end_spacing_item)
-        self._btn_container = QWidget()
+        self._btn_container = QWidget(self._canvas)
         btn_lay = QHBoxLayout(self._btn_container)
         btn_lay.setContentsMargins(0, 0, 0, 0)
         btn_lay.setSpacing(2)
@@ -636,7 +695,6 @@ class FloatBar(QWidget):
             btn_lay.addWidget(b)
         self._btn_container.setGraphicsEffect(self._btn_opacity)
         self._btn_opacity.setOpacity(0.0)
-        self._layout.addWidget(self._btn_container, 0, Qt.AlignmentFlag.AlignVCenter)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_ctx_menu)
         
@@ -679,7 +737,6 @@ class FloatBar(QWidget):
         icon_inner = max(10, self._icon_size - 8)
         btn_radius = max(3, int(7 * scale))
         self._text_layout.setContentsMargins(int(18 * scale), 0, int(18 * scale), 0)
-        self._end_spacing_item.changeSize(int(16 * scale), 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._btn_container.layout().setSpacing(int(2 * scale))
         for b in (self.btn_toggle, self.btn_restart, self.btn_prev, self.btn_next, self.btn_settings, self.btn_close):
             b.setFixedSize(self._icon_size, self._icon_size)
@@ -760,8 +817,11 @@ class FloatBar(QWidget):
         self.lbl_time.style().polish(self.lbl_time)
 
     def _update_size(self) -> None:
+        content = self.content_position() if self._geometry_ready else self.pos()
         if hasattr(self, '_anim_group'):
             self._anim_group.stop()
+        self._side_switching = False
+        self._drawer_left = self._drawer_target_left
         
         scale = getattr(self, '_ui_scale', 100) / 100.0
         fm_stage = self.lbl_stage.fontMetrics()
@@ -795,21 +855,22 @@ class FloatBar(QWidget):
             self._text_width = base_margin + time_w + base_margin
 
         self._full_width = self._text_width + btn_w + int(16 * scale)
+        self._drawer_space = btn_w + int(16 * scale)
         h = max(self._font_size + int(24 * scale), int(50 * scale))
         self.lbl_stage.setFixedHeight(int(h))
         self.lbl_time.setFixedHeight(int(h))
         self._text_container.setFixedSize(int(self._text_width), int(h))
-        
-        self._canvas.setFixedSize(int(self._full_width), int(h))
-        self.setFixedHeight(int(h))
-        
-        if self.underMouse():
-            self.bar_width = int(self._full_width)
-            self._btn_opacity.setOpacity(1.0)
-        else:
-            self.bar_width = int(self._text_width)
-            self._btn_opacity.setOpacity(0.0)
-            
+        self._btn_container.setFixedHeight(int(h))
+        self._text_container.move(self._drawer_space, 0)
+        self._adjusting_geometry = True
+        self._canvas.setFixedSize(self._text_width + 2 * self._drawer_space, int(h))
+        self.setFixedSize(self._canvas.size())
+        self.move_content(content)
+        self._geometry_ready = True
+        self._adjusting_geometry = False
+        self._position_canvas()
+        if self.isVisible() and self._drawer_reveal != self._drawer_goal:
+            self._animate_reveal(self._drawer_goal)
         QTimer.singleShot(10, self._ensure_onscreen)
 
     def _ensure_onscreen(self) -> None:
@@ -819,11 +880,12 @@ class FloatBar(QWidget):
         if not screen:
             return
         avail_geo = screen.availableGeometry()
-        geo = self.geometry()
+        geo = (QRect(self.content_position(), QSize(self._text_width, self.height()))
+               if self._side_switching else self.visible_geometry())
         new_x = max(avail_geo.left(), min(geo.x(), avail_geo.right() - geo.width() + 1))
         new_y = max(avail_geo.top(), min(geo.y(), avail_geo.bottom() - geo.height() + 1))
         if new_x != geo.x() or new_y != geo.y():
-            self.move(new_x, new_y)
+            self.move(self.pos() + QPoint(new_x - geo.x(), new_y - geo.y()))
 
     def update_display(self, stage: str, display_sec: int) -> None:
         was_overtime = self._overtime is not None
@@ -906,12 +968,7 @@ class FloatBar(QWidget):
     def enterEvent(self, e) -> None:
         self._update_drawer_direction()
         self._hide_timer.stop()
-        self._anim_group.stop()
-        self._width_anim.setStartValue(self.width())
-        self._width_anim.setEndValue(self._full_width)
-        self._btn_anim.setStartValue(self._btn_opacity.opacity())
-        self._btn_anim.setEndValue(1.0)
-        self._anim_group.start()
+        self._set_drawer_open(True)
         super().enterEvent(e)
         
     def leaveEvent(self, e) -> None:
@@ -921,12 +978,7 @@ class FloatBar(QWidget):
     def _do_hide_anim(self) -> None:
         if self._drag_pos is not None:
             return
-        self._anim_group.stop()
-        self._width_anim.setStartValue(self.width())
-        self._width_anim.setEndValue(self._text_width)
-        self._btn_anim.setStartValue(self._btn_opacity.opacity())
-        self._btn_anim.setEndValue(0.0)
-        self._anim_group.start()
+        self._set_drawer_open(False)
 
     def _show_ctx_menu(self, pos: QPoint) -> None:
         m = QMenu(self)
@@ -962,7 +1014,7 @@ class FloatBar(QWidget):
         p.setBrush(self._bg_color)
         p.setPen(Qt.PenStyle.NoPen)
         radius = int(12 * getattr(self, '_ui_scale', 100) / 100.0)
-        p.drawRoundedRect(self.rect(), radius, radius)
+        p.drawRoundedRect(self._visible_rect(), radius, radius)
 
     def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:
         if e.button() == Qt.MouseButton.LeftButton:
@@ -971,17 +1023,15 @@ class FloatBar(QWidget):
 
     def mousePressEvent(self, e: QMouseEvent) -> None:
         if e.button() == Qt.MouseButton.LeftButton:
-            self._anim_group.stop()
             self._hide_timer.stop()
             self._drag_pos = e.globalPosition().toPoint() - self.pos()
             self._drag_start_global = e.globalPosition().toPoint()
-            content_x = self.x() + (self.width() - self._text_width if self._drawer_left else 0)
-            self._drag_content_origin = QPoint(content_x, self.y())
+            self._drag_content_origin = self.content_position()
             screen = (QApplication.screenAt(self._drag_start_global) or self.screen()).availableGeometry()
             self._drag_screen = screen
             self._drag_axes = {}
             for axis, value, low, high, pointer in (
-                ('x', self.x(), screen.left(), screen.right()-self.width()+1, self._drag_start_global.x()),
+                ('x', self.content_position().x(), screen.left(), screen.right()-self._text_width+1, self._drag_start_global.x()),
                 ('y', self.y(), screen.top(), screen.bottom()-self.height()+1, self._drag_start_global.y()),
             ):
                 edge = 'low' if abs(value-low) <= 2 else ('high' if abs(value-high) <= 2 else None)
@@ -1011,7 +1061,7 @@ class FloatBar(QWidget):
             pointer = e.globalPosition().toPoint()
             delta = pointer - self._drag_start_global
             content = self._drag_content_origin + delta
-            new_pos = QPoint(content.x() - (self.width()-self._text_width if self._drawer_left else 0), content.y())
+            new_pos = QPoint(content)
             if self._prevent_offscreen:
                 screen_obj = QApplication.screenAt(e.globalPosition().toPoint())
                 screen = screen_obj.availableGeometry() if screen_obj else self.screen().availableGeometry()
@@ -1022,10 +1072,13 @@ class FloatBar(QWidget):
                     for state in self._drag_axes.values():
                         state.update(edge=None, released=True, bias=0)
                     self._drag_screen = screen
-                new_x = self._magnetic_drag_axis(new_x, screen.left(), screen.right()-self.width()+1, 'x', pointer.x())
+                # Anchor snapping to the timer, not a toolbar still changing sides.
+                # Otherwise the old right-hand toolbar can block entry into the
+                # screen's right third before the side-switch animation starts.
+                new_x = self._magnetic_drag_axis(new_x, screen.left(), screen.right()-self._text_width+1, 'x', pointer.x())
                 new_y = self._magnetic_drag_axis(new_y, screen.top(), screen.bottom()-self.height()+1, 'y', pointer.y())
                 new_pos = QPoint(new_x, new_y)
-            self.move(new_pos)
+            self.move_content(new_pos)
             self._update_drawer_direction()
 
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
@@ -1033,27 +1086,16 @@ class FloatBar(QWidget):
         self._drag_axes = {}
         QToolTip.hideText()
         self._ensure_onscreen()
-        content_x = self.x() + (self.width() - self._text_width if self._drawer_left else 0)
-        self.position_changed.emit(content_x, self.y())
+        content = self.content_position()
+        self.position_changed.emit(content.x(), content.y())
 
     def moveEvent(self, e: QMoveEvent) -> None:
         super().moveEvent(e)
         self._update_drawer_direction()
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        if hasattr(self, '_target_opacity'):
-            self.setWindowOpacity(self._target_opacity)
-
-    def resizeEvent(self, e: QResizeEvent) -> None:
-        super().resizeEvent(e)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        if hasattr(self, '_target_opacity'):
-            self.setWindowOpacity(self._target_opacity)
 
     def showEvent(self, e: QShowEvent) -> None:
         super().showEvent(e)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        if hasattr(self, '_target_opacity'):
-            self.setWindowOpacity(self._target_opacity)
+        self._update_drawer_direction()
         if hasattr(self, '_sampling_hwnd'):
             self._sync_capture_exclusion()
 
@@ -1086,25 +1128,13 @@ class SettingsWindow(QDialog):
         self._connect_live_preview_triggers()
 
     def _build_ui(self) -> None:
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        handle = SettingsDragHandle()
-        handle.setAccessibleName("拖动设置窗口")
-        handle.setFixedHeight(30)
-        handle_layout = QHBoxLayout(handle)
-        handle_layout.setContentsMargins(0, 0, 8, 0)
-        handle_layout.addStretch()
+        root = QHBoxLayout(self)
         self.btn_close = QPushButton("×")
         self.btn_close.setAccessibleName("关闭设置")
         self.btn_close.setFixedSize(30, 26)
         self.btn_close.setProperty("role", "quiet")
         self.btn_close.setStyleSheet("QPushButton { padding:0; min-height:0; font-size:22px; border:none; border-radius:5px; color:#718097; background:transparent; } QPushButton:hover { color:#b5303b; background:#fee8eb; }")
         self.btn_close.clicked.connect(self.reject)
-        handle_layout.addWidget(self.btn_close)
-        outer.addWidget(handle)
-        root = QHBoxLayout()
-        outer.addLayout(root, 1)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         sidebar_panel = QWidget()
@@ -1133,22 +1163,37 @@ class SettingsWindow(QDialog):
         self.sidebar.addItems(["流程配置", "预警与声音", "外观与显示", "快捷操作"])
         self.sidebar.setAccessibleName("设置分区")
         sidebar.addWidget(self.sidebar, 1)
-        version = QLabel(f"版本 {__version__}")
+        version = QLabel(f'<a href="{FORK_URL}" style="color:#7b899e; text-decoration:none;">版本 {__version__}</a>')
         version.setObjectName("settingsHint")
+        version.setAccessibleName("查看 fork 仓库版本")
+        version.setToolTip(FORK_URL)
+        version.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        version.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        version.setOpenExternalLinks(True)
         sidebar.addWidget(version)
         root.addWidget(sidebar_panel)
         content = QWidget()
         body = QVBoxLayout(content)
-        body.setContentsMargins(28, 25, 24, 18)
+        body.setContentsMargins(28, 25, 8, 18)
         body.setSpacing(14)
         self.page_title = QLabel()
         self.page_title.setObjectName("pageTitle")
+        self.page_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        handle = SettingsDragHandle()
+        handle.setAccessibleName("拖动或缩放设置窗口")
+        handle.setToolTip("拖动标题行移动窗口，上沿或右沿可缩放；双击最大化或还原")
+        handle_layout = QHBoxLayout(handle)
+        handle_layout.setContentsMargins(0, 0, 0, 0)
+        handle_layout.addWidget(self.page_title)
+        handle_layout.addStretch()
+        handle_layout.addWidget(self.btn_close, 0, Qt.AlignmentFlag.AlignTop)
         self.page_description = QLabel()
         self.page_description.setObjectName("pageDescription")
-        body.addWidget(self.page_title)
+        body.addWidget(handle)
         body.addWidget(self.page_description)
         body.addSpacing(5)
         self.pages = QStackedWidget()
+        self.pages.setContentsMargins(0, 0, 16, 0)
         self.pages.addWidget(self._build_page_stages())
         self.pages.addWidget(self._build_page_alerts())
         self.pages.addWidget(self._build_page_appearance())
@@ -1176,6 +1221,7 @@ class SettingsWindow(QDialog):
         self.btn_save.clicked.connect(self._accept_validated)
         actions.addWidget(self.btn_save)
         actions.addWidget(QSizeGrip(self))
+        actions.addSpacing(16)
         body.addLayout(actions)
         root.addWidget(content, 1)
         self.sidebar.currentRowChanged.connect(self._change_page)
@@ -1187,7 +1233,12 @@ class SettingsWindow(QDialog):
         if not getattr(self, '_initial_focus_set', False):
             self._initial_focus_set = True
             self.sidebar.setFocus()
-            QTimer.singleShot(0, lambda: self.pages.currentWidget().verticalScrollBar().setValue(0))
+            QTimer.singleShot(0, self._scroll_page_to_top)
+
+    def _scroll_page_to_top(self) -> None:
+        page = self.pages.currentWidget()
+        if isinstance(page, QAbstractScrollArea):
+            page.verticalScrollBar().setValue(0)
 
     def _change_page(self, idx: int) -> None:
         titles = [
@@ -1933,10 +1984,10 @@ class App(QObject):
         self.controller.stop()
         
         if self.config.pos_x >= 0 and self.config.pos_y >= 0:
-            self.float_bar.move(self.config.pos_x, self.config.pos_y)
+            self.float_bar.move_content(QPoint(self.config.pos_x, self.config.pos_y))
         else:
             screen = self.float_bar.screen().availableGeometry()
-            self.float_bar.move(screen.left() + 40, screen.top() + 40)
+            self.float_bar.move_content(QPoint(screen.left() + 40, screen.top() + 40))
             
         self.float_bar.show()
 

@@ -17,7 +17,7 @@ screen = app.primaryScreen().availableGeometry()
 back.setGeometry(screen.x()+100, screen.y()+100, 750, 300)
 bar = q.FloatBar()
 bar.update_display('Test', 60)
-bar.move(screen.x()+200, screen.y()+170)
+bar.move_content(q.QPoint(screen.x()+200, screen.y()+170))
 try:
     back.show()
     bar.apply_style('#ffffff', 'Arial', 32, 'Arial', 18, 1,

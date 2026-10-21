@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -159,25 +159,29 @@ class FeatureTests(unittest.TestCase):
         bar = self.bar()
         bar.update_display('阶段', 300)
         screen = bar.screen().availableGeometry()
-        bar.move(screen.right() - bar.width() + 1, screen.top() + 30)
+        bar.move_content(q.QPoint(screen.right() - bar._text_width + 1, screen.top() + 30))
         bar._update_drawer_direction()
         self.assertTrue(bar._drawer_left)
-        anchor = bar.geometry().right()
+        anchor = bar.content_position()
+        native_geometry = bar.geometry()
         bar.bar_width = bar._full_width
-        bar._layout.activate()
         bar._text_layout.activate()
-        self.assertEqual(bar.geometry().right(), anchor)
+        self.assertEqual(bar.content_position(), anchor)
+        self.assertEqual(bar.geometry(), native_geometry)
+        self.assertEqual(bar.visible_geometry().right(), screen.right())
         self.assertLess(bar._btn_container.x(), bar._text_container.x())
         self.assertLess(bar.lbl_stage.x(), bar.lbl_time.x())
         bar.bar_width = bar._text_width
-        self.assertEqual(bar.geometry().right(), anchor)
-        self.assertEqual(bar._text_container.mapTo(bar, q.QPoint()).x(), 0)
-        bar.move(screen.left() + 10, screen.top() + 30)
+        self.assertEqual(bar.content_position(), anchor)
+        self.assertEqual(bar.geometry(), native_geometry)
+        self.assertEqual(bar.visible_geometry().width(), bar._text_width)
+        bar.move_content(q.QPoint(screen.left() + 10, screen.top() + 30))
         bar._update_drawer_direction()
         self.assertFalse(bar._drawer_left)
-        left = bar.x()
+        left = bar.content_position()
         bar.bar_width = bar._full_width
-        self.assertEqual(bar.x(), left)
+        self.assertEqual(bar.content_position(), left)
+        self.assertEqual(bar.visible_geometry().left(), left.x())
 
     def test_settings_are_nonmodal_and_preserve_drag_on_cancel(self):
         instance = self.instance()
@@ -186,17 +190,17 @@ class FeatureTests(unittest.TestCase):
         self.assertFalse(dialog.isModal())
         self.assertEqual(dialog.windowModality(), q.Qt.WindowModality.NonModal)
         dialog.switch_show_label.setChecked(False)
-        instance.float_bar.move(100, 100)
+        instance.float_bar.move_content(q.QPoint(100, 100))
         # Deliver Qt mouse events while the nonmodal settings window is open.
         bar = instance.float_bar
-        start = q.QPointF(10, 10)
-        global_start = q.QPointF(bar.mapToGlobal(q.QPoint(10, 10)))
+        start = q.QPointF(bar._drawer_space + 10, 10)
+        global_start = q.QPointF(bar.mapToGlobal(start.toPoint()))
         APP.sendEvent(bar, q.QMouseEvent(q.QEvent.Type.MouseButtonPress, start, global_start,
                       q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.LeftButton, q.Qt.KeyboardModifier.NoModifier))
         APP.sendEvent(bar, q.QMouseEvent(q.QEvent.Type.MouseMove, start + q.QPointF(30, 20),
                       global_start + q.QPointF(30, 20), q.Qt.MouseButton.NoButton,
                       q.Qt.MouseButton.LeftButton, q.Qt.KeyboardModifier.NoModifier))
-        self.assertEqual(bar.pos(), q.QPoint(130, 120))
+        self.assertEqual(bar.content_position(), q.QPoint(130, 120))
         APP.sendEvent(bar, q.QMouseEvent(q.QEvent.Type.MouseButtonRelease, start + q.QPointF(30, 20),
                       global_start + q.QPointF(30, 20), q.Qt.MouseButton.LeftButton,
                       q.Qt.MouseButton.NoButton, q.Qt.KeyboardModifier.NoModifier))
@@ -301,14 +305,14 @@ class FeatureTests(unittest.TestCase):
                 screen = bar.screen().availableGeometry()
                 x, y = screen.center().x(), screen.center().y()
                 if edge == 'left': x = screen.left()
-                if edge == 'right': x = screen.right()-bar.width()+1
+                if edge == 'right': x = screen.right()-bar._text_width+1
                 if edge == 'top': y = screen.top()
                 if edge == 'bottom': y = screen.bottom()-bar.height()+1
-                bar.move(x, y)
+                bar.move_content(q.QPoint(x, y))
                 bar._update_drawer_direction()
-                start_pos = bar.pos()
-                local = q.QPointF(10, 10)
-                global_start = q.QPointF(bar.mapToGlobal(q.QPoint(10, 10)))
+                start_pos = bar.content_position()
+                local = q.QPointF(bar._drawer_space + 10, 10)
+                global_start = q.QPointF(bar.mapToGlobal(local.toPoint()))
                 def event(kind, delta, button, buttons):
                     APP.sendEvent(bar, q.QMouseEvent(kind, local+delta, global_start+delta,
                                   button, buttons, q.Qt.KeyboardModifier.NoModifier))
@@ -316,13 +320,13 @@ class FeatureTests(unittest.TestCase):
                 direction = q.QPointF(1 if edge=='left' else -1, 0) if edge in ('left','right') else q.QPointF(0, 1 if edge=='top' else -1)
                 for distance in (5, 10, 19):
                     event(q.QEvent.Type.MouseMove, direction*distance, q.Qt.MouseButton.NoButton, q.Qt.MouseButton.LeftButton)
-                    self.assertEqual(bar.pos(), start_pos)
+                    self.assertEqual(bar.content_position(), start_pos)
                 event(q.QEvent.Type.MouseMove, direction*21, q.Qt.MouseButton.NoButton, q.Qt.MouseButton.LeftButton)
-                self.assertEqual(bar.pos(), start_pos+direction.toPoint())
+                self.assertEqual(bar.content_position(), start_pos+direction.toPoint())
                 event(q.QEvent.Type.MouseMove, direction*40, q.Qt.MouseButton.NoButton, q.Qt.MouseButton.LeftButton)
-                self.assertEqual(bar.pos(), start_pos+(direction*20).toPoint())
+                self.assertEqual(bar.content_position(), start_pos+(direction*20).toPoint())
                 event(q.QEvent.Type.MouseMove, direction*25, q.Qt.MouseButton.NoButton, q.Qt.MouseButton.LeftButton)
-                self.assertEqual(bar.pos(), start_pos+(direction*5).toPoint())
+                self.assertEqual(bar.content_position(), start_pos+(direction*5).toPoint())
                 event(q.QEvent.Type.MouseButtonRelease, direction*25, q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.NoButton)
 
     def test_ppt_start_and_exit_pause_are_independent(self):
@@ -441,6 +445,104 @@ class FeatureTests(unittest.TestCase):
         saved = dialog.get_config()
         self.assertFalse(saved.ppt_auto_start)
         self.assertTrue(saved.ppt_auto_pause)
+
+    def test_drawer_animation_keeps_text_and_native_frame_stationary(self):
+        bar = self.bar()
+        bar.update_display('阶段', 300)
+        screen = bar.screen().availableGeometry()
+        bar.move_content(q.QPoint(screen.right() - bar._text_width + 1, screen.top() + 30))
+        bar._update_drawer_direction()
+        bar._text_layout.activate()
+        anchor = bar.content_position()
+        frame = bar.geometry()
+        label_positions = [label.mapToGlobal(q.QPoint()) for label in (bar.lbl_stage, bar.lbl_time)]
+        for progress in list(range(21)) + list(reversed(range(21))):
+            bar.drawer_reveal = progress / 20
+            self.assertEqual(bar.geometry(), frame)
+            self.assertEqual(bar.content_position(), anchor)
+            self.assertEqual([label.mapToGlobal(q.QPoint()) for label in (bar.lbl_stage, bar.lbl_time)], label_positions)
+            self.assertEqual(bar.mask().boundingRect(), bar._visible_rect())
+            if bar._btn_container.isVisibleTo(bar):
+                clip = bar._btn_container.mask().translated(bar._btn_container.pos())
+                self.assertFalse(clip.intersects(bar._text_container.geometry()))
+
+    def test_drawer_side_switch_collapses_then_reopens_and_can_reverse(self):
+        bar = self.bar()
+        bar.update_display('', 60)
+        screen = bar.screen().availableGeometry()
+        left = q.QPoint(screen.left() + 20, screen.top() + 60)
+        right = q.QPoint(screen.right() - bar._text_width + 1, screen.top() + 60)
+        bar.move_content(left)
+        bar.show()
+        bar._set_drawer_open(True)
+        QTest.qWait(260)
+        self.assertAlmostEqual(bar.drawer_reveal, 1.0)
+        bar.move_content(right)
+        bar._update_drawer_direction()
+        self.assertTrue(bar._side_switching)
+        self.assertFalse(bar._drawer_left)
+        anchor = bar.content_position()
+        frame = bar.geometry()
+        QTest.qWait(60)
+        self.assertGreater(bar.drawer_reveal, 0)
+        self.assertLess(bar.drawer_reveal, 1)
+        QTest.qWait(320)
+        self.assertTrue(bar._drawer_left)
+        self.assertAlmostEqual(bar.drawer_reveal, 1.0)
+        self.assertEqual(bar.content_position(), anchor)
+        self.assertEqual(bar.geometry(), frame)
+        bar.move_content(left)
+        bar._update_drawer_direction()
+        QTest.qWait(40)
+        bar.move_content(right)
+        bar._update_drawer_direction()
+        QTest.qWait(260)
+        self.assertFalse(bar._side_switching)
+        self.assertTrue(bar._drawer_left)
+        self.assertAlmostEqual(bar.drawer_reveal, 1.0)
+
+    def test_dragging_expanded_controls_across_boundary_keeps_timer_on_pointer(self):
+        bar = self.bar()
+        bar.update_display('', 60)
+        screen = bar.screen().availableGeometry()
+        origin = q.QPoint(screen.left()+60, screen.top()+80)
+        bar.move_content(origin)
+        bar.show()
+        bar._set_drawer_open(True)
+        QTest.qWait(260)
+        local = q.QPointF(bar._drawer_space + 20, 20)
+        start = q.QPointF(bar.mapToGlobal(local.toPoint()))
+        APP.sendEvent(bar, q.QMouseEvent(q.QEvent.Type.MouseButtonPress, local, start,
+                      q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.LeftButton, q.Qt.KeyboardModifier.NoModifier))
+        target = q.QPoint(int(screen.left()+screen.width()*0.78), origin.y())
+        delta = q.QPointF(target-origin)
+        APP.sendEvent(bar, q.QMouseEvent(q.QEvent.Type.MouseMove, local+delta, start+delta,
+                      q.Qt.MouseButton.NoButton, q.Qt.MouseButton.LeftButton, q.Qt.KeyboardModifier.NoModifier))
+        self.assertEqual(bar.content_position(), target)
+        self.assertTrue(bar._drawer_target_left)
+        QTest.qWait(380)
+        self.assertTrue(bar._drawer_left)
+        self.assertEqual(bar.content_position(), target)
+        APP.sendEvent(bar, q.QMouseEvent(q.QEvent.Type.MouseButtonRelease, local+delta, start+delta,
+                      q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.NoButton, q.Qt.KeyboardModifier.NoModifier))
+
+    def test_settings_header_routes_move_and_resize_to_native_window(self):
+        header = q.SettingsDragHandle()
+        self.widgets.append(header)
+        header.resize(700, 40)
+        window = MagicMock()
+        native = window.windowHandle.return_value
+        native.startSystemMove.return_value = True
+        native.startSystemResize.return_value = True
+        with patch.object(q.SettingsDragHandle, 'window', return_value=window):
+            for position in (q.QPointF(100, 20), q.QPointF(100, 1), q.QPointF(699, 20)):
+                event = q.QMouseEvent(q.QEvent.Type.MouseButtonPress, position, position,
+                                     q.Qt.MouseButton.LeftButton, q.Qt.MouseButton.LeftButton,
+                                     q.Qt.KeyboardModifier.NoModifier)
+                header.mousePressEvent(event)
+        native.startSystemMove.assert_called_once()
+        self.assertEqual(native.startSystemResize.call_args_list[0].args, (q.Qt.Edge.TopEdge,))
+        self.assertEqual(native.startSystemResize.call_args_list[1].args, (q.Qt.Edge.RightEdge,))
 
     def test_settings_are_frameless_and_requested_notes_are_removed(self):
         dialog = q.SettingsWindow(self.config)
