@@ -20,7 +20,7 @@ from settings_ui import AppearancePreview, OptionCheckBox, SETTINGS_STYLE, Toggl
 
 APP_ID = "QTimer"  # Stable storage/instance identity preserves existing installations.
 __app_name__ = "超智能计时器"
-__version__ = "1.6.0-guide.1"
+__version__ = "1.6.1-guide.1"
 __author__ = "QwejayHuang"
 __company__ = "QwejayHuang"
 __description__ = "超智能计时器 · 演示与会议计时"
@@ -1029,6 +1029,13 @@ class SettingsWindow(QDialog):
         sidebar.addWidget(logo)
         brand = QLabel(__app_name__)
         brand.setObjectName("brandName")
+        brand.setAccessibleName(__app_name__)
+        brand.setToolTip(__app_name__)
+        wordmark = QPixmap(resource_path("assets/super-smart-timer-wordmark.png"))
+        if not wordmark.isNull():
+            brand.setPixmap(wordmark.scaled(
+                166, 56, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
         sidebar.addWidget(brand)
         sidebar.addSpacing(12)
         self.sidebar = QListWidget()
