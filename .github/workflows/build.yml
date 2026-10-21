@@ -26,24 +26,12 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements-build.txt
 
       - name: Run PyInstaller
         shell: pwsh
         run: |
-          $buildParams = @(
-              "-F",
-              "-w",
-              "--clean",
-              "--noconfirm",
-              "--add-data", "assets;assets",
-              "--add-data", "icon.ico;.",
-              "-n", "超智能计时器"
-          )
-          if (Test-Path "icon.ico") { $buildParams += "--icon=icon.ico" }
-          if (Test-Path "version.txt") { $buildParams += "--version-file=version.txt" }
-          $buildParams += "main.py"
-          & pyinstaller @buildParams
+          python scripts/build_windows.py
 
       - name: Prepare Artifacts
         shell: pwsh
