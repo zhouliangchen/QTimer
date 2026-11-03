@@ -21,7 +21,7 @@ from config_storage import read_config, write_config, safe_bool, safe_int, safe_
 
 APP_ID = "QTimer"  # Stable storage/instance identity preserves existing installations.
 __app_name__ = "超智能计时器"
-__version__ = "1.8.0-guide.1"
+__version__ = "1.8.1-guide.1"
 FORK_URL = "https://github.com/zhouliangchen/QTimer"
 __author__ = "QwejayHuang"
 __company__ = "QwejayHuang"
@@ -294,6 +294,7 @@ class Config:
         self.show_stage_label: bool = True
         self.ppt_auto_start: bool = True
         self.ppt_auto_pause: bool = True
+        self.ppt_reset_on_start: bool = False
         self.double_click_toggle: bool = True
         self.stages: list[Stage] = [Stage("说课时间", 5, "分", False), Stage("答辩时间", 2, "分", False)]
         self.alerts: list[Alert] = [Alert(30, "#ffaa00", True), Alert(10, "#ff4444", True)]
@@ -328,6 +329,7 @@ class Config:
             "show_stage_label": self.show_stage_label,
             "ppt_auto_start": self.ppt_auto_start,
             "ppt_auto_pause": self.ppt_auto_pause,
+            "ppt_reset_on_start": self.ppt_reset_on_start,
             "double_click_toggle": self.double_click_toggle,
             "stages": [asdict(s) for s in self.stages],
             "alerts": [asdict(a) for a in self.alerts],
@@ -1401,12 +1403,14 @@ class SettingsWindow(QDialog):
         self.switch_auto_advance = ToggleSwitch()
         self.switch_ppt_auto_start = ToggleSwitch()
         self.switch_ppt_auto_pause = ToggleSwitch()
+        self.switch_ppt_reset_on_start = ToggleSwitch()
         self.switch_double_click = ToggleSwitch()
         behav_lay = QVBoxLayout()
         behav_lay.setSpacing(12)
         behav_lay.addWidget(self._make_setting_row("显示环节名称", "在主悬浮球中同步显示各小节文本标题", self.switch_show_label))
         behav_lay.addWidget(self._make_setting_row("自动进入下一环节", "关闭后，到期停留在当前环节，需手动切换；开启后自动切换并继续计时", self.switch_auto_advance))
         behav_lay.addWidget(self._make_setting_row("PPT放映自动开始/恢复计时", "进入 PowerPoint / WPS 全屏放映时生效", self.switch_ppt_auto_start))
+        behav_lay.addWidget(self._make_setting_row("PPT放映时重置到第一环节", "每轮放映开始时恢复第一环节完整时长，是否自动开始由上方开关控制", self.switch_ppt_reset_on_start))
         behav_lay.addWidget(self._make_setting_row("退出PPT自动暂停计时", "退出全屏放映时生效，可独立开关", self.switch_ppt_auto_pause))
         behav_lay.addWidget(self._make_setting_row("双击快捷操作", "双击悬浮窗空白区域快速进行开始/暂停", self.switch_double_click))
         lay.addWidget(self._make_card("行为习惯", behav_lay))
@@ -1613,6 +1617,7 @@ class SettingsWindow(QDialog):
             self.switch_show_label.setChecked(source.show_stage_label)
             self.switch_ppt_auto_start.setChecked(source.ppt_auto_start)
             self.switch_ppt_auto_pause.setChecked(source.ppt_auto_pause)
+            self.switch_ppt_reset_on_start.setChecked(source.ppt_reset_on_start)
             self.switch_double_click.setChecked(source.double_click_toggle)
             for s in source.stages:
                 self._add_stage_row(**asdict(s))
@@ -1987,6 +1992,7 @@ class SettingsWindow(QDialog):
         self.config.show_stage_label = self.switch_show_label.isChecked()
         self.config.ppt_auto_start = self.switch_ppt_auto_start.isChecked()
         self.config.ppt_auto_pause = self.switch_ppt_auto_pause.isChecked()
+        self.config.ppt_reset_on_start = self.switch_ppt_reset_on_start.isChecked()
         self.config.double_click_toggle = self.switch_double_click.isChecked()
         self.config.global_sound = self.switch_global_sound.isChecked()
         self.config.countdown_10s_sound = self.switch_10s_sound.isChecked()
@@ -2072,7 +2078,7 @@ class App(QObject):
         self._on_position_changed(position.x(), position.y())
 
     def _check_ppt_status(self) -> None:
-        if not (self.config.ppt_auto_start or self.config.ppt_auto_pause):
+        if not (self.config.ppt_auto_start or self.config.ppt_auto_pause or self.config.ppt_reset_on_start):
             self._ppt_was_active = False
             self._ppt_stable_active_count = 0
             self._ppt_stable_inactive_count = 0
@@ -2085,6 +2091,8 @@ class App(QObject):
             if self._ppt_stable_active_count >= 2 and not self._ppt_was_active:
                 self._ppt_was_active = True
                 self._current_ppt_session_paused_by_user = False
+                if self.config.ppt_reset_on_start:
+                    self.controller.stop()
                 if self.config.ppt_auto_start and self.controller.paused and self.controller._remaining_float > 0:
                     self.controller.toggle_pause()
             elif self._ppt_stable_active_count >= 2:

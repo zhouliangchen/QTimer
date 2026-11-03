@@ -15,10 +15,11 @@ app.setStyle('Fusion')
 with tempfile.TemporaryDirectory() as root, patch.object(q, 'CONFIG_PATH', str(Path(root)/'config.json')):
     config = q.Config()
     config.global_sound = config.ppt_auto_start = config.ppt_auto_pause = False
-    config.stages = [q.Stage('Native', 30, '秒')]
+    config.stages = [q.Stage('Native', 30, '秒'), q.Stage('Second', 40, '秒')]
     assert config.save()
     with patch.object(q, 'HAS_KEYBOARD', False):
         instance = q.App()
+    instance._ppt_monitor_timer.stop()
     try:
         instance.controller.toggle_pause()
         deadline = instance.controller._target_time
@@ -33,6 +34,29 @@ with tempfile.TemporaryDirectory() as root, patch.object(q, 'CONFIG_PATH', str(P
         QTest.qWait(300)
         assert 28 < instance.controller._remaining_float < 30
         print('native settings save: deadline preserved, timer continues')
+        instance.controller.next_stage()
+        instance.controller.toggle_pause()
+        instance._open_settings()
+        dialog = instance._settings_window
+        dialog.switch_ppt_reset_on_start.setChecked(True)
+        QTest.mouseClick(dialog.btn_save, q.Qt.MouseButton.LeftButton)
+        assert instance.controller._stage_idx == 1
+        with patch.object(q, 'is_ppt_slideshow_active', return_value=True):
+            instance._check_ppt_status()
+            instance._check_ppt_status()
+        assert instance.controller._stage_idx == 0
+        assert instance.controller._remaining_float == 30
+        assert instance.controller.paused
+        assert instance.float_bar.lbl_time.text() == '00:30'
+        instance.config.ppt_auto_start = True
+        with patch.object(q, 'is_ppt_slideshow_active', return_value=False):
+            instance._check_ppt_status()
+            instance._check_ppt_status()
+        with patch.object(q, 'is_ppt_slideshow_active', return_value=True):
+            instance._check_ppt_status()
+            instance._check_ppt_status()
+        assert not instance.controller.paused
+        print('native PPT reset option: persisted, first stage restored, auto-start remains independent')
         instance.float_bar.move_content(q.QPoint(180, 160))
         instance._on_position_changed(180, 160)
         with patch.object(q, 'HAS_KEYBOARD', False), patch.object(q.QApplication, 'quit'):

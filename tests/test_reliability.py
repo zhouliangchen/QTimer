@@ -261,6 +261,120 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(instance.float_bar.content_position(), expected)
         self.assertEqual((instance.config.pos_x, instance.config.pos_y), (expected.x(), expected.y()))
 
+    def test_ppt_reset_option_is_default_off_and_persists_without_resetting_now(self):
+        self.path.write_text('{"ppt_auto_start": false}', encoding='utf-8')
+        legacy = q.Config()
+        legacy.load()
+        self.assertFalse(legacy.ppt_reset_on_start)
+        instance = self.instance()
+        instance.controller.next_stage()
+        with patch.object(q.time, 'monotonic', return_value=100):
+            instance.controller.toggle_pause()
+            deadline = instance.controller._target_time
+            instance._open_settings()
+            dialog = instance._settings_window
+            self.assertFalse(dialog.switch_ppt_reset_on_start.isChecked())
+            dialog.switch_ppt_reset_on_start.setChecked(True)
+            dialog._accept_validated()
+        self.assertEqual(instance.controller._stage_idx, 1)
+        self.assertFalse(instance.controller.paused)
+        self.assertEqual(instance.controller._target_time, deadline)
+        restored = q.Config()
+        restored.load()
+        self.assertTrue(restored.ppt_reset_on_start)
+        instance._open_settings()
+        dialog = instance._settings_window
+        self.assertTrue(dialog.switch_ppt_reset_on_start.isChecked())
+        dialog._restore_defaults()
+        self.assertFalse(dialog.switch_ppt_reset_on_start.isChecked())
+        dialog.reject()
+        self.assertTrue(instance.config.ppt_reset_on_start)
+
+    def test_ppt_reset_and_auto_start_are_independent(self):
+        for reset in (False, True):
+            for start in (False, True):
+                with self.subTest(reset=reset, start=start):
+                    instance = self.instance()
+                    instance.config.ppt_reset_on_start = reset
+                    instance.config.ppt_auto_start = start
+                    instance.controller.next_stage()
+                    instance.controller._remaining_float = 7
+                    with patch.object(q, 'is_ppt_slideshow_active', return_value=True), patch.object(q.time, 'monotonic', return_value=100):
+                        instance._check_ppt_status()
+                        self.assertEqual(instance.controller._stage_idx, 1)
+                        self.assertEqual(instance.controller._remaining_float, 7)
+                        instance._check_ppt_status()
+                    self.assertEqual(instance.controller._stage_idx, 0 if reset else 1)
+                    self.assertEqual(instance.controller._remaining_float, 10 if reset else 7)
+                    self.assertEqual(instance.controller.paused, not start)
+
+    def test_ppt_reset_occurs_once_per_confirmed_session_and_retains_manual_pause(self):
+        instance = self.instance()
+        instance.config.ppt_reset_on_start = True
+        instance.config.ppt_auto_start = True
+        def detect(active, count=2):
+            with patch.object(q, 'is_ppt_slideshow_active', return_value=active):
+                for _ in range(count):
+                    instance._check_ppt_status()
+        with patch.object(q.time, 'monotonic', return_value=100):
+            instance.controller.next_stage()
+            detect(True)
+            self.assertEqual(instance.controller._stage_idx, 0)
+            self.assertFalse(instance.controller.paused)
+            instance.controller.next_stage()
+            instance.controller._remaining_float = 6
+            detect(True, 4)
+            self.assertEqual(instance.controller._stage_idx, 1)
+            self.assertEqual(instance.controller._remaining_float, 6)
+            with patch.object(q, 'is_ppt_slideshow_active', return_value=True):
+                instance._handle_user_action(instance.controller.toggle_pause)
+            detect(True)
+            self.assertTrue(instance.controller.paused)
+            detect(False, 1)
+            detect(True)
+            self.assertEqual(instance.controller._stage_idx, 1)
+            self.assertTrue(instance.controller.paused)
+            detect(False)
+            detect(True)
+            self.assertEqual(instance.controller._stage_idx, 0)
+            self.assertEqual(instance.controller._remaining_float, 10)
+            self.assertFalse(instance.controller.paused)
+
+    def test_ppt_reset_restarts_an_expired_countdown_when_auto_start_enabled(self):
+        instance = self.instance()
+        instance.config.ppt_reset_on_start = True
+        instance.config.ppt_auto_start = True
+        instance.controller.next_stage()
+        instance.controller._remaining_float = 0
+        instance.controller._zero_triggered = True
+        with patch.object(q, 'is_ppt_slideshow_active', return_value=True), patch.object(q.time, 'monotonic', return_value=100):
+            instance._check_ppt_status()
+            instance._check_ppt_status()
+        self.assertEqual(instance.controller._stage_idx, 0)
+        self.assertEqual(instance.controller._remaining_float, 10)
+        self.assertFalse(instance.controller.paused)
+        self.assertEqual(instance.controller._target_time, 110)
+
+    def test_ppt_reset_clears_overtime_and_alerts_and_starts_countup_at_zero(self):
+        instance = self.instance()
+        instance.config.stages[0] = q.Stage('Count up', 10, '秒', True)
+        instance.config.ppt_reset_on_start = True
+        instance.controller.next_stage()
+        instance.controller._remaining_float = 0
+        instance.controller._zero_triggered = True
+        instance.float_bar.show_overtime(q.Stage('', timeout_display='image', timeout_image='preset:overdue-red'))
+        instance.float_bar.apply_alert('#ff0000', True)
+        with patch.object(q, 'is_ppt_slideshow_active', return_value=True):
+            instance._check_ppt_status()
+            instance._check_ppt_status()
+        self.assertEqual(instance.controller._stage_idx, 0)
+        self.assertEqual(instance.controller._remaining_float, 10)
+        self.assertTrue(instance.controller.paused)
+        self.assertFalse(instance.controller._zero_triggered)
+        self.assertFalse(instance.float_bar._flash_timer.isActive())
+        self.assertIsNone(instance.float_bar._overtime)
+        self.assertEqual(instance.float_bar.lbl_time.text(), '00:00')
+
     def test_exit_flushes_position_before_delayed_save_fires(self):
         instance = self.instance()
         instance.float_bar.move_content(q.QPoint(300, 200))
